@@ -180,6 +180,8 @@ fn gen_metrics_from_state(state: &ServerState) -> String {
                 res.push_str(format!("availcheck_status_code{{website=\"{}\"}} {}\n", val.name, data.status_code).as_str());
                 res.push_str(format!("availcheck_response_time_ms{{website=\"{}\"}} {}\n", val.name, data.response_time.as_millis()).as_str());
                 res.push_str(format!("availcheck_response_size{{website=\"{}\"}} {}\n", val.name, data.response_size).as_str());
+                res.push_str(format!("availcheck_timeout{{website=\"{}\"}} 0\n", val.name).as_str());
+                res.push_str(format!("availcheck_error{{website=\"{}\"}} 0\n", val.name).as_str());
             },
             MessageType::Timeout => res.push_str(format!("availcheck_timeout{{website=\"{}\"}} 1\n", val.name).as_str()),
             MessageType::Error => res.push_str(format!("availcheck_error{{website=\"{}\"}} 1\n", val.name).as_str())
@@ -230,7 +232,7 @@ fn main() -> std::io::Result<()> {
     loop {
         match rx.recv() {
             Ok(msg) => {
-                println!("{:?}", msg);
+                // println!("{:?}", msg);
                 let mut state_wrt = state.write().unwrap();
                 if state_wrt.websites.contains(&msg.website) {
                     *state_wrt.last_state.get_mut(&msg.website.url).unwrap() = msg.msg;
