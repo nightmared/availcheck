@@ -3,13 +3,13 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 
-use tiny_http::{Server, Response};
+use tiny_http::Server;
 
 use curl::easy::Easy;
 
@@ -46,14 +46,16 @@ pub fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::
 	})
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
-struct CheckTime(u64);
+fn default_checktime() -> u64 {
+    15
+}
 
-// Check every 15 seconds by default
-impl std::default::Default for CheckTime {
-    fn default() -> CheckTime {
-        CheckTime(15)
-    }
+fn default_port() -> u16 {
+    9666
+}
+
+fn default_addr() -> IpAddr {
+    IpAddr::from(Ipv4Addr::new(0, 0, 0, 0))
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -61,13 +63,17 @@ struct Website {
     // TODO: sanitize this field
     name: String,
     url: String,
-    #[serde(default)]
-    check_time_seconds: CheckTime
+    #[serde(default="default_checktime")]
+    check_time_seconds: u64
 }
 
 #[derive(Deserialize)]
 struct FileConfig {
-    websites: Vec<Website>
+    websites: Vec<Website>,
+    #[serde(default="default_port")]
+    listen_port: u16,
+    #[serde(default="default_addr")]
+    listen_addr: IpAddr
 }
 
 struct Config {
@@ -84,10 +90,9 @@ impl From<FileConfig> for Config {
                     .into_iter()
                     .map(|x| Arc::new(x))
                     .collect(),
-            listen_addr: IpAddr::from(Ipv4Addr::new(0, 0, 0, 0)),
-            listen_port: 9666
+            listen_addr: fc.listen_addr,
+            listen_port: fc.listen_port
         }
-
     }
 }
 
@@ -122,7 +127,7 @@ struct Message {
 }
 
 fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
-    let wait_time = Duration::new(ws.check_time_seconds.0, 0);
+    let wait_time = Duration::new(ws.check_time_seconds, 0);
     let mut start;
     loop {
         start = Instant::now();
@@ -195,14 +200,28 @@ fn web_server(config: Config, state: Arc<RwLock<ServerState>>) {
         addr: SocketAddr::from((config.listen_addr, config.listen_port)),
         ssl: None
     };
-    let server = Server::new(server_config).unwrap();
+    let server = Arc::new(Server::new(server_config).unwrap());
 
-    for request in server.incoming_requests() {
-        if request.url() == "/metrics" {
-            let data = gen_metrics_from_state(&state.read().unwrap());
-            let res = tiny_http::Response::from_string(data);
-            request.respond(res);
-        }
+    // spawn 4 worker threads
+    for i in 0..4 {
+        let server = server.clone();
+        let state = state.clone();
+        thread::Builder::new()
+            .name(format!("WebSrv {}", i))
+            .spawn(move || {
+            loop {
+                if let Ok(request) = server.recv() {
+                    if request.url() == "/metrics" {
+                        let data = gen_metrics_from_state(&state.read().unwrap());
+                        let res = tiny_http::Response::from_string(data);
+                        let _ = request.respond(res);
+                    } else {
+                        let res = tiny_http::Response::from_string("Get metrics at /metrics");
+                        let _ = request.respond(res);
+                    }
+                }
+            }
+        }).unwrap();
     }
 }
 
@@ -217,17 +236,18 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = channel();
 
     for website in &config.websites {
-        println!("{:?}", website);
+        //println!("{:?}", website);
         let website = website.clone();
         let tx = tx.clone();
-        thread::spawn(|| loop_website(website, tx));
+        thread::Builder::new()
+            .name(format!("Website_getter {}", website.name))
+            .spawn(move || loop_website(website, tx))?;
     }
 
     let state = Arc::new(RwLock::new(
             ServerState { websites: vec![], last_state: HashMap::new() }));
 
-    let state_clone = state.clone();
-    thread::spawn(|| web_server(config, state_clone));
+    web_server(config, state.clone());
 
     loop {
         match rx.recv() {
