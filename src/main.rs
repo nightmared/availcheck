@@ -164,48 +164,42 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
     }
 }
 
-// The invariant the ServerState seeks to maintain is that at any (observable) time,
-// there exists a one-to-one mapping between the elements of the 'websites'
+// The invariant the ServerState struct seeks to maintain is that at any (observable)
+// time, there exists a one-to-one mapping between the elements of the 'websites'
 // field and those of the the 'last_state' field
 struct ServerState {
     websites: Vec<Arc<Website>>,
     // indexed by the website url
     last_state: HashMap<String, MessageType>
 }
-fn add_metrics_to_string(datas: Vec<(&Arc<Website>, impl std::fmt::Display)>, name: &str, s: &mut String) {
-    for val in datas {
-        s.push_str(format!("availcheck_{}{{website=\"{}\"}} {}\n", name, val.0.name, val.1).as_str());
+
+impl ServerState {
+    fn add_metrics_to_string<T: std::fmt::Display>(&self, s: &mut String, name: &str, f: &dyn Fn(&MessageType) -> Option<T>) {
+        for ws in &self.websites {
+            // this unwrap is "safe" as per our invariant
+            if let Some(v) = f(self.last_state.get(&ws.url).unwrap()) {
+                s.push_str(format!("availcheck_{}{{website=\"{}\"}} {}\n", name, ws.name, v).as_str());
+            }
+        }
     }
 }
 
+// TODO: add prometheus help to explain the meaning of the variables
 fn gen_metrics_from_state(state: &ServerState) -> String {
     // simple heuristic to reduce pointless allocations
-    let mut errors = Vec::with_capacity(state.websites.len());
-    let mut timeouts = Vec::with_capacity(state.websites.len());
-    let mut status_code = Vec::with_capacity(state.websites.len());
-    let mut response_time_ms = Vec::with_capacity(state.websites.len());
-    let mut response_size = Vec::with_capacity(state.websites.len());
-    for val in &state.websites {
-        // this unwrap is "safe" as per our invariant
-        match state.last_state.get(&val.url).unwrap() {
-            MessageType::Answer(data) => {
-                errors.push((val, 0));
-                timeouts.push((val, 0));
-                status_code.push((val, data.status_code));
-                response_time_ms.push((val, data.response_time.as_millis()));
-                response_size.push((val, data.response_size));
-            },
-            MessageType::Timeout => timeouts.push((val, 1)),
-            MessageType::Error => errors.push((val, 1)),
-            MessageType::Exit => ()
-        }
-    }
     let mut res = String::with_capacity(state.websites.len() * 75);
-    add_metrics_to_string(errors, "errors", &mut res);
-    add_metrics_to_string(timeouts, "timeouts", &mut res);
-    add_metrics_to_string(status_code, "status_code", &mut res);
-    add_metrics_to_string(response_time_ms, "response_time_ms", &mut res);
-    add_metrics_to_string(response_size, "response_size", &mut res);
+
+    state.add_metrics_to_string(&mut res, "errors",
+        &|msg| if let &MessageType::Error = msg { Some(1) } else { None });
+    state.add_metrics_to_string(&mut res, "timeouts",
+        &|msg| if let &MessageType::Timeout = msg { Some(1) } else { None });
+    state.add_metrics_to_string(&mut res, "status_code",
+        &|msg| if let &MessageType::Answer(ref data) = msg { Some(data.status_code ) } else { None });
+    state.add_metrics_to_string(&mut res, "response_time_ms",
+        &|msg| if let &MessageType::Answer(ref data) = msg { Some(data.response_time.as_millis() ) } else { None });
+    state.add_metrics_to_string(&mut res, "response_size",
+        &|msg| if let &MessageType::Answer(ref data) = msg { Some(data.response_size ) } else { None });
+
     res
 }
 
