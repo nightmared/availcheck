@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tiny_http::Server;
 
@@ -58,42 +59,36 @@ fn default_addr() -> IpAddr {
     IpAddr::from(Ipv4Addr::new(0, 0, 0, 0))
 }
 
-#[derive(Deserialize, Debug, PartialEq)]
+fn default_enabled() -> AtomicBool {
+    AtomicBool::new(true)
+}
+
+#[derive(Deserialize, Debug)]
 struct Website {
     // TODO: sanitize this field
     name: String,
     url: String,
     #[serde(default="default_checktime")]
-    check_time_seconds: u64
+    check_time_seconds: u64,
+    #[serde(skip_deserializing, default = "default_enabled")]
+    enabled: AtomicBool
 }
 
+// We cannot simply derive that since AtomicBool is not comparable
+impl PartialEq for Website {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+    }
+}
+impl Eq for Website {}
+
 #[derive(Deserialize)]
-struct FileConfig {
-    websites: Vec<Website>,
+struct Config {
+    websites: Vec<Arc<Website>>,
     #[serde(default="default_port")]
     listen_port: u16,
     #[serde(default="default_addr")]
     listen_addr: IpAddr
-}
-
-struct Config {
-    websites: Vec<Arc<Website>>,
-    listen_port: u16,
-    listen_addr: IpAddr
-}
-
-impl From<FileConfig> for Config {
-    fn from(fc: FileConfig) -> Config {
-        Config {
-            websites:
-                fc.websites
-                    .into_iter()
-                    .map(|x| Arc::new(x))
-                    .collect(),
-            listen_addr: fc.listen_addr,
-            listen_port: fc.listen_port
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -104,11 +99,11 @@ struct AnswerData {
 }
 
 impl AnswerData {
-    fn new(handle: &mut Easy, data_length: u64) -> AnswerData {
+    fn new(handle: &mut Easy) -> AnswerData {
         AnswerData {
             status_code: handle.response_code().unwrap(),
             response_time: handle.total_time().unwrap()-handle.namelookup_time().unwrap(),
-            response_size: data_length
+            response_size: handle.download_size().unwrap() as u64
         }
     }
 }
@@ -131,30 +126,31 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
     let wait_time = Duration::new(ws.check_time_seconds, 0);
     let mut start;
     loop {
+        if !ws.enabled.load(Ordering::Acquire) {
+            send_queue.send(Message {
+                website: ws,
+                msg: MessageType::Exit
+            }).unwrap();
+            return;
+        }
+
         start = Instant::now();
         let mut handle = Easy::new();
         // TODO: considering we are going to do plenty of dns lookups, caching should be used
         handle.url(&ws.url).unwrap();
         handle.timeout(Duration::new(7, 0)).unwrap();
+        let res = handle.perform();
 
-        let mut res_size = 0;
-        let res = {
-            let mut transfer = handle.transfer();
-            transfer.write_function(|new_data| {
-                res_size += new_data.len();
-                Ok(res_size)
-            }).unwrap();
-            transfer.perform()
-        };
         let msg = Message {
             website: ws.clone(),
             msg:
                 match res {
-                    Ok(_) => MessageType::Answer(AnswerData::new(&mut handle, res_size as u64)),
+                    Ok(_) => MessageType::Answer(AnswerData::new(&mut handle)),
                     Err(e) => {
                         if e.is_operation_timedout() {
                             MessageType::Timeout
                         } else {
+                            println!("Error on the website {}: {:?}", ws.name, e);
                             MessageType::Error
                         }
                     }
@@ -246,10 +242,7 @@ fn web_server(config: Config, state: Arc<RwLock<ServerState>>) {
 // TODO: support runtime upgrade
 
 fn main() -> std::io::Result<()> {
-    let config = {
-        let file_config: FileConfig = load_app_data("config.yml")?;
-        Config::from(file_config)
-    };
+    let config: Config =  load_app_data("config.yml")?;
 
     let (tx, rx) = channel();
 
@@ -275,7 +268,6 @@ fn main() -> std::io::Result<()> {
     loop {
         match rx.recv() {
             Ok(msg) => {
-                // println!("{:?}", msg);
                 let mut state_wrt = state.write().unwrap();
                 if state_wrt.websites.contains(&msg.website) {
                     *state_wrt.last_state.get_mut(&msg.website.url).unwrap() = msg.msg;
