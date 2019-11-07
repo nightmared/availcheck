@@ -117,7 +117,8 @@ impl AnswerData {
 enum MessageType {
     Answer(AnswerData),
     Timeout,
-    Error
+    Error,
+    Exit
 }
 
 #[derive(Debug)]
@@ -134,7 +135,7 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
         let mut handle = Easy::new();
         // TODO: considering we are going to do plenty of dns lookups, caching should be used
         handle.url(&ws.url).unwrap();
-        handle.timeout(Duration::new(3, 0)).unwrap();
+        handle.timeout(Duration::new(7, 0)).unwrap();
 
         let mut res_size = 0;
         let res = {
@@ -145,20 +146,21 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
             }).unwrap();
             transfer.perform()
         };
-        send_queue.send(Message {
-                website: ws.clone(),
-                msg: 
-                    match res {
-                        Ok(_) => MessageType::Answer(AnswerData::new(&mut handle, res_size as u64)),
-                        Err(e) => {
-                            if e.is_operation_timedout() {
-                                MessageType::Timeout
-                            } else {
-                                MessageType::Error
-                            }
+        let msg = Message {
+            website: ws.clone(),
+            msg:
+                match res {
+                    Ok(_) => MessageType::Answer(AnswerData::new(&mut handle, res_size as u64)),
+                    Err(e) => {
+                        if e.is_operation_timedout() {
+                            MessageType::Timeout
+                        } else {
+                            MessageType::Error
                         }
                     }
-        }).unwrap();
+                }
+        };
+        send_queue.send(msg).unwrap();
         // prevent against suprious wakeups
         while start.elapsed() < wait_time {
             thread::sleep(wait_time-start.elapsed());
@@ -174,24 +176,40 @@ struct ServerState {
     // indexed by the website url
     last_state: HashMap<String, MessageType>
 }
+fn add_metrics_to_string(datas: Vec<(&Arc<Website>, impl std::fmt::Display)>, name: &str, s: &mut String) {
+    for val in datas {
+        s.push_str(format!("availcheck_{}{{website=\"{}\"}} {}\n", name, val.0.name, val.1).as_str());
+    }
+}
 
 fn gen_metrics_from_state(state: &ServerState) -> String {
     // simple heuristic to reduce pointless allocations
-    let mut res = String::with_capacity(state.websites.len() * 100);
+    let mut errors = Vec::with_capacity(state.websites.len());
+    let mut timeouts = Vec::with_capacity(state.websites.len());
+    let mut status_code = Vec::with_capacity(state.websites.len());
+    let mut response_time_ms = Vec::with_capacity(state.websites.len());
+    let mut response_size = Vec::with_capacity(state.websites.len());
     for val in &state.websites {
         // this unwrap is "safe" as per our invariant
         match state.last_state.get(&val.url).unwrap() {
             MessageType::Answer(data) => {
-                res.push_str(format!("availcheck_status_code{{website=\"{}\"}} {}\n", val.name, data.status_code).as_str());
-                res.push_str(format!("availcheck_response_time_ms{{website=\"{}\"}} {}\n", val.name, data.response_time.as_millis()).as_str());
-                res.push_str(format!("availcheck_response_size{{website=\"{}\"}} {}\n", val.name, data.response_size).as_str());
-                res.push_str(format!("availcheck_timeout{{website=\"{}\"}} 0\n", val.name).as_str());
-                res.push_str(format!("availcheck_error{{website=\"{}\"}} 0\n", val.name).as_str());
+                errors.push((val, 0));
+                timeouts.push((val, 0));
+                status_code.push((val, data.status_code));
+                response_time_ms.push((val, data.response_time.as_millis()));
+                response_size.push((val, data.response_size));
             },
-            MessageType::Timeout => res.push_str(format!("availcheck_timeout{{website=\"{}\"}} 1\n", val.name).as_str()),
-            MessageType::Error => res.push_str(format!("availcheck_error{{website=\"{}\"}} 1\n", val.name).as_str())
+            MessageType::Timeout => timeouts.push((val, 1)),
+            MessageType::Error => errors.push((val, 1)),
+            MessageType::Exit => ()
         }
     }
+    let mut res = String::with_capacity(state.websites.len() * 75);
+    add_metrics_to_string(errors, "errors", &mut res);
+    add_metrics_to_string(timeouts, "timeouts", &mut res);
+    add_metrics_to_string(status_code, "status_code", &mut res);
+    add_metrics_to_string(response_time_ms, "response_time_ms", &mut res);
+    add_metrics_to_string(response_size, "response_size", &mut res);
     res
 }
 
@@ -207,7 +225,7 @@ fn web_server(config: Config, state: Arc<RwLock<ServerState>>) {
         let server = server.clone();
         let state = state.clone();
         thread::Builder::new()
-            .name(format!("WebSrv {}", i))
+            .name(format!("HTTP Serv {}", i))
             .spawn(move || {
             loop {
                 if let Ok(request) = server.recv() {
@@ -236,18 +254,23 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = channel();
 
     for website in &config.websites {
-        //println!("{:?}", website);
+        println!("Watching {} under name {}", website.url, website.name);
         let website = website.clone();
         let tx = tx.clone();
         thread::Builder::new()
-            .name(format!("Website_getter {}", website.name))
+            .name(format!("Curl {}", website.name))
             .spawn(move || loop_website(website, tx))?;
     }
 
     let state = Arc::new(RwLock::new(
             ServerState { websites: vec![], last_state: HashMap::new() }));
 
-    web_server(config, state.clone());
+    let state_clone = state.clone();
+    // we spawn this thread for the only reason that it allows us to give HTTP
+    // listener threads a meaningful name
+    thread::Builder::new()
+        .name(format!("HTTP Pool"))
+        .spawn(move ||  web_server(config, state_clone))?;
 
     loop {
         match rx.recv() {
