@@ -1,0 +1,18 @@
+[Unit]
+Description=Prometheus exporter for availcheck
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+User=nightmared
+Group=nightmared
+Restart=on-failure
+Environment="XDG_CONFIG_HOME=/home/nightmared/.config"
+ExecStart=/home/nightmared/dev/availcheck/target/release/availcheck
+ExecReload=/bin/kill -HUP $MAINPID
+NoNewPrivileges=true
+ProtectHome=false
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
