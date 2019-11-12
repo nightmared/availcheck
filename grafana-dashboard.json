@@ -16,7 +16,7 @@
   "gnetId": null,
   "graphTooltip": 0,
   "id": 10,
-  "iteration": 1573143016633,
+  "iteration": 1573560510823,
   "links": [],
   "panels": [
     {
@@ -336,10 +336,9 @@
       {
         "allValue": null,
         "current": {
-          "selected": false,
           "tags": [],
-          "text": "10.0.25.2:9666",
-          "value": "10.0.25.2:9666"
+          "text": "10.0.24.3:9666",
+          "value": "10.0.24.3:9666"
         },
         "datasource": "Prometheus",
         "definition": "label_values(availcheck_errors, instance)",
@@ -350,7 +349,7 @@
         "name": "instance",
         "options": [],
         "query": "label_values(availcheck_errors, instance)",
-        "refresh": 1,
+        "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
@@ -363,7 +362,7 @@
     ]
   },
   "time": {
-    "from": "now-6h",
+    "from": "now-7d",
     "to": "now"
   },
   "timepicker": {
@@ -383,5 +382,5 @@
   "timezone": "",
   "title": "Availcheck",
   "uid": "vdWOUqAWk",
-  "version": 14
+  "version": 16
 }

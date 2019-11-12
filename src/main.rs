@@ -213,9 +213,9 @@ fn gen_metrics_from_state(state: &ServerState) -> String {
     let mut res = String::with_capacity(state.websites.len() * 75);
 
     state.add_metrics_to_string(&mut res, "errors",
-        &|msg| if let &WebsiteMessageType::Error = msg { Some(1) } else { None });
+        &|msg| if let &WebsiteMessageType::Error = msg { Some(1) } else { Some(0) });
     state.add_metrics_to_string(&mut res, "timeouts",
-        &|msg| if let &WebsiteMessageType::Timeout = msg { Some(1) } else { None });
+        &|msg| if let &WebsiteMessageType::Timeout = msg { Some(1) } else { Some(0) });
     state.add_metrics_to_string(&mut res, "status_code",
         &|msg| if let &WebsiteMessageType::Answer(ref data) = msg { Some(data.status_code ) } else { None });
     state.add_metrics_to_string(&mut res, "response_time_ms",
