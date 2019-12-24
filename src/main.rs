@@ -9,6 +9,7 @@ use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 
 use tiny_http::{Server, Method};
 
@@ -74,6 +75,13 @@ struct Website {
     enabled: AtomicBool
 }
 
+
+impl std::hash::Hash for Website {
+    fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
+        self.url.hash(hasher);
+    }
+}
+
 // We cannot simply derive that since AtomicBool is not comparable
 impl PartialEq for Website {
     fn eq(&self, other: &Self) -> bool {
@@ -84,23 +92,24 @@ impl Eq for Website {}
 
 #[derive(Deserialize)]
 struct Config {
-    websites: Vec<Arc<Website>>,
+    websites: HashSet<Arc<Website>>,
     #[serde(default="default_port")]
     listen_port: u16,
     #[serde(default="default_addr")]
     listen_addr: IpAddr
 }
 
+
 #[derive(Debug, PartialEq)]
-struct AnswerData {
+struct MetricData {
     status_code: u32,
     response_time: Duration,
     response_size: u64
 }
 
-impl AnswerData {
-    fn new(handle: &mut Easy) -> AnswerData {
-        AnswerData {
+impl MetricData {
+    fn new(handle: &mut Easy) -> MetricData {
+        MetricData {
             status_code: handle.response_code().unwrap(),
             response_time: handle.total_time().unwrap()-handle.namelookup_time().unwrap(),
             response_size: handle.download_size().unwrap() as u64
@@ -108,11 +117,17 @@ impl AnswerData {
     }
 }
 
+
+#[derive(Debug, PartialEq)]
+enum MetricResult {
+    Success(MetricData),
+    Timeout,
+    Error
+}
+
 #[derive(Debug, PartialEq)]
 enum WebsiteMessageType {
-    Answer(AnswerData),
-    Timeout,
-    Error,
+    MetricResult(MetricResult),
     Exit
 }
 
@@ -131,7 +146,9 @@ enum Message {
 fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
     let wait_time = Duration::new(ws.check_time_seconds, 0);
     let mut start;
+    let mut handle = Easy::new();
     loop {
+        start = Instant::now();
         if !ws.enabled.load(Ordering::Acquire) {
             send_queue.send(Message::WebsiteMessage(WebsiteMessage {
                 website: ws,
@@ -140,9 +157,6 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
             return;
         }
 
-        start = Instant::now();
-        let mut handle = Easy::new();
-        // TODO: considering we are going to do plenty of dns lookups, caching should be used
         handle.url(&ws.url).unwrap();
         handle.timeout(Duration::new(7, 0)).unwrap();
         let res = handle.perform();
@@ -150,17 +164,19 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
         let msg = WebsiteMessage {
             website: ws.clone(),
             msg:
-                match res {
-                    Ok(_) => WebsiteMessageType::Answer(AnswerData::new(&mut handle)),
-                    Err(e) => {
-                        if e.is_operation_timedout() {
-                            WebsiteMessageType::Timeout
-                        } else {
-                            println!("Error on the website {}: {:?}", ws.name, e);
-                            WebsiteMessageType::Error
+                WebsiteMessageType::MetricResult(
+                    match res {
+                        Ok(_) => MetricResult::Success(MetricData::new(&mut handle)),
+                        Err(e) => {
+                            if e.is_operation_timedout() {
+                                MetricResult::Timeout
+                            } else {
+                                println!("Error on the website {}: {:?}", ws.name, e);
+                                MetricResult::Error
+                            }
                         }
                     }
-                }
+                )
         };
         send_queue.send(Message::WebsiteMessage(msg)).unwrap();
         // prevent against suprious wakeups
@@ -170,39 +186,35 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
     }
 }
 
-// The invariant the ServerState struct seeks to maintain is that at any (observable)
-// time, there exists a one-to-one mapping between the elements of the 'websites'
-// field and those of the the 'last_state' field
 struct ServerState {
-    websites: Vec<Arc<Website>>,
-    // indexed by the website url
-    last_state: HashMap<String, WebsiteMessageType>
+    internal: HashMap<Arc<Website>, MetricResult>
 }
 
 impl ServerState {
-    fn add_metrics_to_string<T: std::fmt::Display>(&self, s: &mut String, name: &str, f: &dyn Fn(&WebsiteMessageType) -> Option<T>) {
-        for ws in &self.websites {
-            // this unwrap is "safe" as per our invariant
-            if let Some(v) = f(self.last_state.get(&ws.url).unwrap()) {
-                s.push_str(format!("availcheck_{}{{website=\"{}\"}} {}\n", name, ws.name, v).as_str());
+    fn add_metrics_to_string<T: std::fmt::Display>(&self, s: &mut String, name: &str, f: &dyn Fn(&MetricResult) -> Option<T>) {
+        for ws in self.internal.keys() {
+            match self.internal.get(ws) {
+                None => eprintln!("Something is DEEEPLY wrong here !"),
+                Some(e) => {
+                    if let Some(v) = f(&e) {
+                        s.push_str(
+                            format!("availcheck_{}{{website=\"{}\"}} {}\n",
+                            name, ws.name, v)
+                        .as_str());
+                    }
+                }
             }
         }
     }
     fn delete_website(&mut self, website: &Arc<Website>) {
-        // was it registered in the ServerState ?
-        if let Some(pos) = self.websites.iter().position(|x| x.url == website.url) {
-            self.websites.remove(pos);
-            self.last_state.remove(&website.url).unwrap();
-        }
+        self.internal.remove(website);
     }
 
-    fn update_metrics(&mut self, website: &Arc<Website>, value: WebsiteMessageType) {
-        if self.websites.contains(website) {
-            *self.last_state.get_mut(&website.url).unwrap() = value;
+    fn update_metrics(&mut self, website: &Arc<Website>, value: MetricResult) {
+        if self.internal.contains_key(website) {
+            *self.internal.get_mut(website).unwrap() = value;
         } else {
-            // first time we see this website, let's add it to the list
-            self.websites.push(website.clone());
-            self.last_state.insert(website.url.clone(), value);
+            self.internal.insert(website.clone(), value);
          }
     }
 }
@@ -210,18 +222,18 @@ impl ServerState {
 // TODO: add prometheus help to explain the meaning of the variables
 fn gen_metrics_from_state(state: &ServerState) -> String {
     // simple heuristic to reduce pointless allocations
-    let mut res = String::with_capacity(state.websites.len() * 75);
+    let mut res = String::with_capacity(state.internal.keys().len() * 75);
 
     state.add_metrics_to_string(&mut res, "errors",
-        &|msg| if let &WebsiteMessageType::Error = msg { Some(1) } else { Some(0) });
+        &|msg| if let MetricResult::Error = msg { Some(1) } else { Some(0) });
     state.add_metrics_to_string(&mut res, "timeouts",
-        &|msg| if let &WebsiteMessageType::Timeout = msg { Some(1) } else { Some(0) });
+        &|msg| if let MetricResult::Timeout = msg { Some(1) } else { Some(0) });
     state.add_metrics_to_string(&mut res, "status_code",
-        &|msg| if let &WebsiteMessageType::Answer(ref data) = msg { Some(data.status_code ) } else { None });
+        &|msg| if let MetricResult::Success(ref data) = msg { Some(data.status_code ) } else { None });
     state.add_metrics_to_string(&mut res, "response_time_ms",
-        &|msg| if let &WebsiteMessageType::Answer(ref data) = msg { Some(data.response_time.as_millis() ) } else { None });
+        &|msg| if let MetricResult::Success(ref data) = msg { Some(data.response_time.as_millis() ) } else { None });
     state.add_metrics_to_string(&mut res, "response_size",
-        &|msg| if let &WebsiteMessageType::Answer(ref data) = msg { Some(data.response_size ) } else { None });
+        &|msg| if let MetricResult::Success(ref data) = msg { Some(data.response_size ) } else { None });
 
     res
 }
@@ -290,7 +302,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let state = Arc::new(RwLock::new(
-            ServerState { websites: vec![], last_state: HashMap::new() }));
+            ServerState { internal: HashMap::new() }));
 
     let state_clone = state.clone();
     let tx_clone = tx.clone();
@@ -307,10 +319,9 @@ fn main() -> std::io::Result<()> {
             Ok(Message::WebsiteMessage(msg)) => {
                 let mut state_wrt = state.write().unwrap();
                 // This website was deleted at runtime, let's remove it
-                if msg.msg == WebsiteMessageType::Exit {
-                    state_wrt.delete_website(&msg.website);
-                } else {
-                    state_wrt.update_metrics(&msg.website, msg.msg);
+                match msg.msg {
+                    WebsiteMessageType::Exit  => state_wrt.delete_website(&msg.website),
+                    WebsiteMessageType::MetricResult(e) => state_wrt.update_metrics(&msg.website, e)
                 }
             },
             Ok(Message::ReloadConfig) => {
@@ -326,34 +337,30 @@ fn main() -> std::io::Result<()> {
                     }
                 };
 
-                // track the number of changes
-                let mut changes = 0;
 
                 // enumerate differences and apply them
-                // Yes this is O(n²), but we uses availcheck with a big number of websites
-                // anyway !? (and you know what ? we even do this twice :-D)
-                // In the future, we may switch from Vec to HashSet.
-                for x in &new_config.websites {
-                    // website x has been added
-                    if !config.websites.contains(&x) {
-                        changes += 1;
+                let differences = new_config.websites.symmetric_difference(&config.websites);
+                let mut changes = 0;
+                for x in differences {
+                    changes += 1;
+                    if !config.websites.contains(x) {
+                        // website x has been added
                         spawn_watcher(x, tx.clone())?;
-                    }
-                }
-
-                for x in &config.websites {
-                    // website x has been deleted
-                    if !new_config.websites.contains(&x) {
-                        changes += 1;
+                    } else {
+                        // website x has been deleted
                         x.enabled.store(false, Ordering::Release);
                     }
                 }
 
+                if new_config.listen_port != config.listen_port
+                    || new_config.listen_addr != config.listen_addr {
+
+                }
                 config = new_config;
                 println!("Server reloading finished successfully with {} changes !", changes);
             },
             Err(e) => {
-                eprintln!("{} error encountered while reading on a channel, exiting...", e);
+                eprintln!("{} error encountered while reading on the main channel, exiting...", e);
                 panic!();
             }
         }
