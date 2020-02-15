@@ -13,9 +13,8 @@ use std::collections::HashSet;
 
 use tiny_http::{Server, Method};
 
-use curl::easy::Easy;
-
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use serde::de::{Error, Visitor};
 
 
 fn get_base_dir() -> PathBuf {
@@ -56,6 +55,10 @@ fn default_port() -> u16 {
     9666
 }
 
+fn default_dns_refresh_time() -> u64 {
+    120
+}
+
 fn default_addr() -> IpAddr {
     IpAddr::from(Ipv4Addr::new(0, 0, 0, 0))
 }
@@ -64,11 +67,80 @@ fn default_enabled() -> AtomicBool {
     AtomicBool::new(true)
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct HttpStruct {
+    query: String,
+    tls_enabled: bool,
+    port: u16,
+    host: String,
+    path: String
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum Url {
+    Http(HttpStruct)
+}
+
+
+
+struct UrlVisitor;
+
+impl<'de> Visitor<'de> for UrlVisitor {
+    type Value = Url;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an url matching scheme://host:port/path")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: Error,
+    {
+        let scheme_and_remainder: Vec<&str> = value.splitn(2, "://").collect();
+        if scheme_and_remainder.len() != 2 {
+            return Err(Error::invalid_value(serde::de::Unexpected::Str(value), &self));
+        }
+        let host_and_path: Vec<&str> = scheme_and_remainder[1].splitn(2, '/').collect();
+        let path = host_and_path
+            .get(1)
+            .and_then(|&x| Some(x.into()))
+            .unwrap_or(String::new());
+
+        let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
+        match scheme_and_remainder[0] {
+            "http" | "https" =>
+                Ok(Url::Http(HttpStruct {
+                    query: value.into(),
+                    tls_enabled: scheme_and_remainder[0] == "https",
+                    port: host_and_port
+                            .get(1)
+                            .and_then(|x| str::parse::<u16>(x).ok())
+                            .unwrap_or_else(|| if scheme_and_remainder[0] == "https" { 443 } else { 80 })
+                    ,
+                    host: host_and_port[0].into(),
+                    path
+                })),
+            _ => Err(Error::invalid_value(serde::de::Unexpected::Str(value), &self))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Url {
+    fn deserialize<D>(deserializer: D) -> Result<Url, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(UrlVisitor)
+    }
+}
+
+
+
 #[derive(Deserialize, Debug)]
 struct Website {
     // TODO: sanitize this field
     name: String,
-    url: String,
+    url: Url,
     #[serde(default="default_checktime")]
     check_time_seconds: u64,
     #[serde(skip_deserializing, default = "default_enabled")]
@@ -90,29 +162,37 @@ impl PartialEq for Website {
 }
 impl Eq for Website {}
 
-#[derive(Deserialize)]
-struct Config {
-    websites: HashSet<Arc<Website>>,
+#[derive(Deserialize, PartialEq)]
+struct GlobalConfig {
     #[serde(default="default_port")]
     listen_port: u16,
     #[serde(default="default_addr")]
-    listen_addr: IpAddr
+    listen_addr: IpAddr,
+    #[serde(default="default_dns_refresh_time")]
+    dns_refresh_time_seconds: u64
+}
+
+#[derive(Deserialize, PartialEq)]
+struct Config {
+    websites: HashSet<Arc<Website>>,
+    #[serde(flatten)]
+    global: Arc<GlobalConfig>
 }
 
 
 #[derive(Debug, PartialEq)]
 struct MetricData {
-    status_code: u32,
+    status_code: u16,
     response_time: Duration,
     response_size: u64
 }
 
 impl MetricData {
-    fn new(handle: &mut Easy) -> MetricData {
+    fn from_http(handle: attohttpc::Response, duration: Duration) -> MetricData {
         MetricData {
-            status_code: handle.response_code().unwrap(),
-            response_time: handle.total_time().unwrap()-handle.namelookup_time().unwrap(),
-            response_size: handle.download_size().unwrap() as u64
+            status_code: handle.status().as_u16(),
+            response_time: duration,
+            response_size: handle.bytes().unwrap().len() as u64
         }
     }
 }
@@ -143,12 +223,11 @@ enum Message {
     ReloadConfig
 }
 
-fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
+fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<Message>) {
     let wait_time = Duration::new(ws.check_time_seconds, 0);
+    let mut dns_resolution_start = Instant::now();
     let mut start;
-    let mut handle = Easy::new();
     loop {
-        start = Instant::now();
         if !ws.enabled.load(Ordering::Acquire) {
             send_queue.send(Message::WebsiteMessage(WebsiteMessage {
                 website: ws,
@@ -156,30 +235,49 @@ fn loop_website(ws: Arc<Website>, send_queue: Sender<Message>) {
             })).unwrap();
             return;
         }
+        if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
+        }
+        start = Instant::now();
 
-        handle.url(&ws.url).unwrap();
-        handle.timeout(Duration::new(7, 0)).unwrap();
-        let res = handle.perform();
+
+        let res = match &ws.url {
+            Url::Http(http_opts) => {
+                attohttpc::RequestBuilder::try_new(attohttpc::Method::GET, &http_opts.query)
+                    .map(|x|
+                        x.timeout(Duration::new(7, 0))
+                        .header(attohttpc::header::HeaderName::from_static("host"), attohttpc::header::HeaderValue::from_str(&http_opts.host).unwrap())
+                    )
+                    .unwrap()
+                    .send()
+            }
+        };
+        // this is far from ideal (we could be preempted after getting an answer and before reading
+        // the time) but atohttpc doesn't expose timing information so we have to restrict ourselves
+        // to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
+        let stop_timing = start.elapsed();
 
         let msg = WebsiteMessage {
             website: ws.clone(),
             msg:
                 WebsiteMessageType::MetricResult(
                     match res {
-                        Ok(_) => MetricResult::Success(MetricData::new(&mut handle)),
+                        Ok(res) => MetricResult::Success(MetricData::from_http(res, stop_timing)),
                         Err(e) => {
-                            if e.is_operation_timedout() {
-                                MetricResult::Timeout
+                            let mut err = MetricResult::Error;
+                            if let attohttpc::ErrorKind::Io(e) = e.kind() {
+                                if e.kind() == std::io::ErrorKind::TimedOut {
+                                    err = MetricResult::Timeout;
+                                }
                             } else {
                                 println!("Error on the website {}: {:?}", ws.name, e);
-                                MetricResult::Error
                             }
+                            err
                         }
                     }
                 )
         };
         send_queue.send(Message::WebsiteMessage(msg)).unwrap();
-        // prevent against suprious wakeups
+        // prevent against spurious wakeups
         while start.elapsed() < wait_time {
             thread::sleep(wait_time-start.elapsed());
         }
@@ -283,12 +381,12 @@ fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerSta
     }
 }
 
-fn spawn_watcher(website: &Arc<Website>, tx: Sender<Message>) -> std::io::Result<()> {
-    println!("Watching {} under name {}", website.url, website.name);
+fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<Message>) -> std::io::Result<()> {
+    println!("Watching {}", website.name);
     let website = website.clone();
     thread::Builder::new()
         .name(format!("Curl {}", website.name))
-        .spawn(move || loop_website(website, tx))?;
+        .spawn(move || loop_website(global_config.clone(), website, tx))?;
     Ok(())
 }
 
@@ -298,7 +396,7 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = channel();
 
     for website in &config.websites {
-        spawn_watcher(website, tx.clone())?;
+        spawn_watcher(config.global.clone(), website, tx.clone())?;
     }
 
     let state = Arc::new(RwLock::new(
@@ -306,8 +404,8 @@ fn main() -> std::io::Result<()> {
 
     let state_clone = state.clone();
     let tx_clone = tx.clone();
-    let (listen_addr, listen_port) = (config.listen_addr, config.listen_port);
-    // we spawn this thread for the only reason that it allows us to give HTTP
+    let (listen_addr, listen_port) = (config.global.listen_addr, config.global.listen_port);
+    // we spawn this thread for the sole reason that it allows us to give HTTP
     // listener threads a meaningful name
     thread::Builder::new()
         .name(format!("HTTP Pool"))
@@ -338,26 +436,38 @@ fn main() -> std::io::Result<()> {
                 };
 
 
-                // enumerate differences and apply them
-                let differences = new_config.websites.symmetric_difference(&config.websites);
-                let mut changes = 0;
-                for x in differences {
-                    changes += 1;
-                    if !config.websites.contains(x) {
-                        // website x has been added
-                        spawn_watcher(x, tx.clone())?;
-                    } else {
-                        // website x has been deleted
-                        x.enabled.store(false, Ordering::Release);
+                if new_config.global != config.global {
+                    // disable every watcher and spawn new ones, as the global config changed
+                    for w in config.websites {
+                        w.enabled.store(false, Ordering::Release);
                     }
-                }
+                    for w in &new_config.websites {
+                        spawn_watcher(new_config.global.clone(), &w, tx.clone())?;
+                    }
+                    println!("Server fully reloaded.");
+                } else {
+                    // enumerate the websites that should be added/deleted
+                    let differences = new_config.websites.symmetric_difference(&config.websites);
+                    // start/stop watchers accordingly
+                    let mut changes = 0;
+                    for x in differences {
+                        changes += 1;
+                        if !config.websites.contains(x) {
+                            // website x has been added
+                            spawn_watcher(new_config.global.clone(), x, tx.clone())?;
+                        } else {
+                            // website x has been deleted
+                            x.enabled.store(false, Ordering::Release);
+                        }
+                    }
+                    println!("Server reloading finished successfully with {} changes.", changes);
+                };
 
-                if new_config.listen_port != config.listen_port
-                    || new_config.listen_addr != config.listen_addr {
+                if new_config.global.listen_port != config.global.listen_port
+                    || new_config.global.listen_addr != config.global.listen_addr {
 
                 }
                 config = new_config;
-                println!("Server reloading finished successfully with {} changes !", changes);
             },
             Err(e) => {
                 eprintln!("{} error encountered while reading on the main channel, exiting...", e);
