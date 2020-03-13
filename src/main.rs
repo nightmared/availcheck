@@ -3,12 +3,13 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use crossbeam_channel::{unbounded, Sender};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
+
+use crossbeam_channel::{unbounded, select, Sender};
 
 use warp::Filter;
 
@@ -171,11 +172,31 @@ struct GlobalConfig {
 	dns_refresh_time_seconds: u64
 }
 
+impl Default for GlobalConfig {
+	fn default() -> Self {
+		GlobalConfig {
+			listen_port: default_port(),
+			listen_addr: default_addr(),
+			dns_refresh_time_seconds: default_dns_refresh_time()
+		}
+	}
+}
+
+
 #[derive(Deserialize, PartialEq)]
 struct Config {
 	websites: HashSet<Arc<Website>>,
 	#[serde(flatten)]
 	global: Arc<GlobalConfig>
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Config {
+			websites: HashSet::new(),
+			global: Arc::new(GlobalConfig::default())
+		}
+	}
 }
 
 
@@ -204,7 +225,7 @@ enum MetricResult {
 }
 
 impl MetricResult {
-	fn map_sucess<F>(mut self, fun: F) -> MetricResult
+	fn map_success<F>(mut self, fun: F) -> MetricResult
 	where F: Fn(&mut MetricData) {
 		if let MetricResult::Success(ref mut md) = self {
 			fun(md);
@@ -240,21 +261,16 @@ enum WebsiteMessageType {
 }
 
 #[derive(Debug, PartialEq)]
-struct WebsiteMessage {
+struct WatcherMessage {
 	website: Arc<Website>,
 	msg: WebsiteMessageType
 }
 
 #[derive(Debug, PartialEq)]
-enum Message {
-	WebsiteMessage(WebsiteMessage),
+enum WebServMessage {
 	ReloadConfig
 }
 
-#[derive(Debug, PartialEq)]
-enum Error {
-
-}
 
 fn run_query(url: &Url) -> MetricResult {
 	let stop;
@@ -277,19 +293,19 @@ fn run_query(url: &Url) -> MetricResult {
 		};
 		stop = start.elapsed();
 		output
-	}).map_sucess(|x| x.response_time = Some(stop))
+	}).map_success(|x| x.response_time = Some(stop))
 }
 
-fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<Message>) {
+fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
 	let mut dns_resolution_start = Instant::now();
 	loop {
 		let start = Instant::now();
 		if !ws.enabled.load(Ordering::Acquire) {
-			send_queue.send(Message::WebsiteMessage(WebsiteMessage {
+			send_queue.send(WatcherMessage {
 				website: ws,
 				msg: WebsiteMessageType::Exit
-			})).unwrap();
+			}).unwrap();
 			return;
 		}
 		if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
@@ -300,12 +316,10 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 			Err(_) => MetricResult::Error
 		};
 
-		let msg = WebsiteMessage {
+		send_queue.send(WatcherMessage {
 			website: ws.clone(),
 			msg: WebsiteMessageType::MetricResult(res)
-		};
-
-		send_queue.send(Message::WebsiteMessage(msg)).unwrap();
+		}).unwrap();
 		// the 'while' loop prevents against spurious wakeups
 		while start.elapsed() < wait_time {
 			thread::sleep(wait_time-start.elapsed());
@@ -365,7 +379,7 @@ fn gen_metrics_from_state(state: &ServerState) -> String {
 	res
 }
 
-async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>, tx: Sender<Message>) {
+async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>, tx: Sender<WebServMessage>) {
 	let get_metrics = warp::path("metrics")
 		.and(warp::path::end())
 		.map(move || gen_metrics_from_state(&state.read().unwrap()) );
@@ -381,7 +395,7 @@ async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<Ser
 			// local adresses, or by adding a rule to your config if you have a
 			// web server/load balancer in front on top of this server,
 			// otherwise you risk a DoS if someone call this (very) frequently !
-			tx.send(Message::ReloadConfig).unwrap();
+			tx.send(WebServMessage::ReloadConfig).unwrap();
 			"Server reloading requested, check the server logs"
 		});
 
@@ -393,7 +407,7 @@ async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<Ser
 	warp::serve(routes).run(SocketAddr::from((listen_addr, listen_port))).await
 }
 
-fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<Message>) -> std::io::Result<()> {
+fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<WatcherMessage>) -> std::io::Result<()> {
 	println!("Watching {}", website.name);
 	let website = website.clone();
 	thread::Builder::new()
@@ -402,86 +416,101 @@ fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: S
 	Ok(())
 }
 
+fn reload_config(config: &mut Config, tx_watchers: Sender<WatcherMessage>) -> std::io::Result<()> {
+	// Updating the list of websites to check (it should be noted that changing the
+	// http listening port or adress is not possible at runtime).
+	println!("Server reloading asked, let's see what we can do for you...");
+	// reload the config
+	let new_config: Config = match load_app_data("config.yml") {
+		Ok(x) => x,
+		Err(e) => {
+			eprintln!("Looks like your config file is invalid, aborting the procedure: {}", e);
+			return Ok(());
+		}
+	};
+
+
+	if new_config.global != config.global {
+		// disable every watcher and spawn new ones, as the global config changed, which may
+		// impact every watchers (in case a variable like "dns_refresh_time" changes)
+		// TODO: separate the webserver config from the one impacting the watchers to prevent too
+		// many restarts
+		for w in &config.websites {
+			w.enabled.store(false, Ordering::Release);
+		}
+		for w in &new_config.websites {
+			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone())?;
+		}
+		println!("Server fully reloaded.");
+	} else {
+		// enumerate the websites that should be added/deleted
+		let differences = new_config.websites.symmetric_difference(&config.websites);
+		// start/stop watchers accordingly
+		let mut changes = 0;
+		for x in differences {
+			changes += 1;
+			if !config.websites.contains(x) {
+				// website x has been added
+				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone())?;
+			} else {
+				// website x has been deleted
+				x.enabled.store(false, Ordering::Release);
+			}
+		}
+		println!("Server reloading finished successfully with {} changes.", changes);
+	};
+
+	if new_config.global.listen_port != config.global.listen_port
+		|| new_config.global.listen_addr != config.global.listen_addr {
+
+	}
+	*config = new_config;
+	Ok(())
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-	let mut config: Config =  load_app_data("config.yml")?;
+	let mut config: Config = Config::default();
 
-	let (tx, rx) = unbounded();
+	let (tx_watchers, rx_watchers): (crossbeam_channel::Sender<WatcherMessage>, crossbeam_channel::Receiver<WatcherMessage>) = unbounded();
+	let (tx_webserv, rx_webserv) = unbounded();
 
-	for website in &config.websites {
-		spawn_watcher(config.global.clone(), website, tx.clone())?;
-	}
+	// force config reloading at startup
+	// (the main advanatge of this is that there is no substantial difference between the initial
+	// setup and subsequent refreshes)
+	tx_webserv.send(WebServMessage::ReloadConfig).unwrap();
 
 	let state = Arc::new(RwLock::new(
-			ServerState { internal: HashMap::new() }));
+		ServerState { internal: HashMap::new() }));
 
 	let state_clone = state.clone();
-	let tx_clone = tx.clone();
 
 	let (listen_addr, listen_port) = (config.global.listen_addr, config.global.listen_port);
 
-	tokio::spawn(async move { web_server(listen_addr, listen_port, state_clone, tx_clone).await });
+	tokio::spawn(async move { web_server(listen_addr, listen_port, state_clone, tx_webserv).await });
 
 	loop {
-		match rx.recv() {
-			Ok(Message::WebsiteMessage(msg)) => {
-				let mut state_wrt = state.write().unwrap();
-				// This website was deleted at runtime, let's remove it
-				match msg.msg {
-					WebsiteMessageType::Exit  => state_wrt.delete_website(&msg.website),
-					WebsiteMessageType::MetricResult(e) => state_wrt.update_metrics(&msg.website, e)
+		select! {
+			recv(rx_watchers) -> msg => match msg {
+				Ok(msg) => {
+					let mut state_wrt = state.write().unwrap();
+					// This website was deleted at runtime, let's remove it
+					match msg.msg {
+						WebsiteMessageType::Exit  => state_wrt.delete_website(&msg.website),
+						WebsiteMessageType::MetricResult(e) => state_wrt.update_metrics(&msg.website, e)
+					}
+				},
+				Err(e) => {
+					eprintln!("{} error encountered while reading on the watchers channel, exiting...", e);
+					panic!();
 				}
 			},
-			Ok(Message::ReloadConfig) => {
-				// Updating the list of websites to check (it should be noted that changing the
-				// http listening port or adress is not possible at runtime).
-				println!("Server reloading asked, let's see what we can do for you...");
-				// reload the config
-				let new_config: Config = match load_app_data("config.yml") {
-					Ok(x) => x,
-					Err(e) => {
-						eprintln!("Looks like your config file is invalid, aborting the procedure: {}", e);
-						continue;
-					}
-				};
-
-
-				if new_config.global != config.global {
-					// disable every watcher and spawn new ones, as the global config changed
-					for w in config.websites {
-						w.enabled.store(false, Ordering::Release);
-					}
-					for w in &new_config.websites {
-						spawn_watcher(new_config.global.clone(), &w, tx.clone())?;
-					}
-					println!("Server fully reloaded.");
-				} else {
-					// enumerate the websites that should be added/deleted
-					let differences = new_config.websites.symmetric_difference(&config.websites);
-					// start/stop watchers accordingly
-					let mut changes = 0;
-					for x in differences {
-						changes += 1;
-						if !config.websites.contains(x) {
-							// website x has been added
-							spawn_watcher(new_config.global.clone(), x, tx.clone())?;
-						} else {
-							// website x has been deleted
-							x.enabled.store(false, Ordering::Release);
-						}
-					}
-					println!("Server reloading finished successfully with {} changes.", changes);
-				};
-
-				if new_config.global.listen_port != config.global.listen_port
-					|| new_config.global.listen_addr != config.global.listen_addr {
-
+			recv(rx_webserv) -> msg => match msg {
+				Ok(WebServMessage::ReloadConfig) => reload_config(&mut config, tx_watchers.clone())?,
+				Err(e) => {
+					eprintln!("{} error encountered while reading on the web server channel, exiting...", e);
+					panic!();
 				}
-				config = new_config;
-			},
-			Err(e) => {
-				eprintln!("{} error encountered while reading on the main channel, exiting...", e);
-				panic!();
 			}
 		}
 	}
