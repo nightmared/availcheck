@@ -2,14 +2,15 @@ use std::{env, thread, panic};
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, mpsc::{channel, Sender}};
+use std::sync::{Arc, RwLock};
+use crossbeam_channel::{unbounded, Sender};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
 
-use tiny_http::{Server, Method};
+use warp::Filter;
 
 use serde::{Deserialize, Deserializer};
 use serde::de;
@@ -256,14 +257,13 @@ enum Error {
 }
 
 fn run_query(url: &Url) -> MetricResult {
-	let start;
 	let stop;
 
 	MetricResult::from({
 		// this is far from ideal (we could be preempted after getting an answer and before reading
 		// the time) but atohttpc doesn't expose timing information so we have to restrict ourselves
 		// to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
-		start = Instant::now();
+		let start = Instant::now();
 		let output = match url {
 			Url::Http(http_opts) => {
 				attohttpc::RequestBuilder::try_new(attohttpc::Method::GET, &http_opts.query)
@@ -295,7 +295,10 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 		if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
 		}
 
-		let res = run_query(&ws.url);
+		let res = match panic::catch_unwind(|| run_query(&ws.url)) {
+			Ok(x) => x,
+			Err(_) => MetricResult::Error
+		};
 
 		let msg = WebsiteMessage {
 			website: ws.clone(),
@@ -362,64 +365,48 @@ fn gen_metrics_from_state(state: &ServerState) -> String {
 	res
 }
 
-fn web_handler(server: Arc<Server>, state: Arc<RwLock<ServerState>>, tx: Sender<Message>) {
-	loop {
-		if let Ok(request) = server.recv() {
-			if request.url() == "/metrics" {
-				let data = gen_metrics_from_state(&state.read().unwrap());
-				let res = tiny_http::Response::from_string(data);
-				let _ = request.respond(res);
-			} else if request.url() == "/server-reload" && *request.method() == Method::Post {
-				// It is crucial to require the client to perform POST request to update the state
-				// to prevent caching and to respect the fact that GET requests MUST be idempotent.
-				//
-				// Note: You MUST protect this endpoint, either by exposing the server only to
-				// local adresses, or by adding a rule to your config if you have a
-				// web server/load balancer in front on top of this server,
-				// otherwise you risk a DoS if someone call this (very) frequently !
-				tx.send(Message::ReloadConfig).unwrap();
-				let res = tiny_http::Response::from_string("Server reloading requested, check the server logs");
-				let _ = request.respond(res);
-			} else {
-				let res = tiny_http::Response::from_string("Get metrics at /metrics");
-				let _ = request.respond(res);
-			}
-		}
-	}
-}
+async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>, tx: Sender<Message>) {
+	let get_metrics = warp::path("metrics")
+		.and(warp::path::end())
+		.map(move || gen_metrics_from_state(&state.read().unwrap()) );
 
-fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>, tx: Sender<Message>) {
-	let server_config = tiny_http::ServerConfig {
-		addr: SocketAddr::from((listen_addr, listen_port)),
-		ssl: None
-	};
-	let server = Arc::new(Server::new(server_config).unwrap());
+	let reload_server = warp::post()
+		.and(warp::path("server-reload"))
+		.and(warp::path::end())
+		.map(move || {
+			// It is crucial to require the client to perform POST request to update the state
+			// to prevent caching and to respect the fact that GET requests MUST be idempotent.
+			//
+			// Note: You MUST protect this endpoint, either by exposing the server only to
+			// local adresses, or by adding a rule to your config if you have a
+			// web server/load balancer in front on top of this server,
+			// otherwise you risk a DoS if someone call this (very) frequently !
+			tx.send(Message::ReloadConfig).unwrap();
+			"Server reloading requested, check the server logs"
+		});
 
-	// spawn 4 worker threads
-	for i in 0..4 {
-		let server = server.clone();
-		let state = state.clone();
-		let tx = tx.clone();
-		thread::Builder::new()
-			.name(format!("HTTP Serv {}", i))
-			.spawn(move || web_handler(server, state, tx))
-			.unwrap();
-	}
+	let default_path = warp::any()
+		.map(|| "Get metrics at /metrics" );
+
+	let routes = get_metrics.or(reload_server).or(default_path);
+
+	warp::serve(routes).run(SocketAddr::from((listen_addr, listen_port))).await
 }
 
 fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<Message>) -> std::io::Result<()> {
 	println!("Watching {}", website.name);
 	let website = website.clone();
 	thread::Builder::new()
-		.name(format!("Curl {}", website.name))
+		.name(format!("Q_{}", website.name))
 		.spawn(move || loop_website(global_config.clone(), website, tx))?;
 	Ok(())
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
 	let mut config: Config =  load_app_data("config.yml")?;
 
-	let (tx, rx) = channel();
+	let (tx, rx) = unbounded();
 
 	for website in &config.websites {
 		spawn_watcher(config.global.clone(), website, tx.clone())?;
@@ -430,13 +417,10 @@ fn main() -> std::io::Result<()> {
 
 	let state_clone = state.clone();
 	let tx_clone = tx.clone();
+
 	let (listen_addr, listen_port) = (config.global.listen_addr, config.global.listen_port);
-	// we spawn this thread for the sole reason that it allows us to give HTTP
-	// listener threads a meaningful name
-	thread::Builder::new()
-		.name(format!("HTTP Pool"))
-		.spawn(move ||	web_server(listen_addr, listen_port, state_clone, tx_clone))?
-		.join().expect("Couldn't spawn the HTTP Server");
+
+	tokio::spawn(async move { web_server(listen_addr, listen_port, state_clone, tx_clone).await });
 
 	loop {
 		match rx.recv() {
