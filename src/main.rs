@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 
 use tokio::sync::oneshot;
 
@@ -331,23 +329,25 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 }
 
 struct ServerState {
-	internal: HashMap<Arc<Website>, MetricResult>,
+	websites: HashMap<Arc<Website>, MetricResult>,
 	// the first element is a channel to ask the webserver to shutdown itself, and the second one
 	// is a receiver notified when the server is supposedly stopped
-	shutdown_web_server_chan: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>
+	shutdown_web_server_chan: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+	webserver_chan: Sender<WebServMessage>
 }
 
 impl ServerState {
-	fn new_empty() -> Arc<RwLock<Self>> {
+	fn new_empty(tx_webserv: Sender<WebServMessage>) -> Arc<RwLock<Self>> {
 		Arc::new(RwLock::new(ServerState {
-			internal: HashMap::new(),
-			shutdown_web_server_chan: None
+			websites: HashMap::new(),
+			shutdown_web_server_chan: None,
+			webserver_chan: tx_webserv
 		}))
 	}
 
 	fn add_metrics_to_string<T: std::fmt::Display>(&self, s: &mut String, name: &str, f: &dyn Fn(&MetricResult) -> Option<T>) {
-		for ws in self.internal.keys() {
-			match self.internal.get(ws) {
+		for ws in self.websites.keys() {
+			match self.websites.get(ws) {
 				None => eprintln!("Something is DEEEPLY wrong here !"),
 				Some(e) => {
 					if let Some(v) = f(&e) {
@@ -361,14 +361,14 @@ impl ServerState {
 		}
 	}
 	fn delete_website(&mut self, website: &Arc<Website>) {
-		self.internal.remove(website);
+		self.websites.remove(website);
 	}
 
 	fn update_metrics(&mut self, website: &Arc<Website>, value: MetricResult) {
-		if self.internal.contains_key(website) {
-			*self.internal.get_mut(website).unwrap() = value;
+		if self.websites.contains_key(website) {
+			*self.websites.get_mut(website).unwrap() = value;
 		} else {
-			self.internal.insert(website.clone(), value);
+			self.websites.insert(website.clone(), value);
 		 }
 	}
 }
@@ -376,7 +376,7 @@ impl ServerState {
 // TODO: add prometheus help to explain the meaning of the variables
 fn gen_metrics_from_state(state: &ServerState) -> String {
 	// simple heuristic to reduce pointless allocations
-	let mut res = String::with_capacity(state.internal.keys().len() * 75);
+	let mut res = String::with_capacity(state.websites.keys().len() * 75);
 
 	state.add_metrics_to_string(&mut res, "errors",
 		&|msg| if let MetricResult::Error = msg { Some(1) } else { Some(0) });
@@ -392,7 +392,8 @@ fn gen_metrics_from_state(state: &ServerState) -> String {
 	res
 }
 
-async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>, tx: Sender<WebServMessage>) {
+async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<ServerState>>) {
+	let tx = state.read().unwrap().webserver_chan.clone();
 	let get_metrics = warp::path("metrics")
 		.and(warp::path::end())
 		.map(move || gen_metrics_from_state(&state.read().unwrap()) );
@@ -429,7 +430,47 @@ fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: S
 	Ok(())
 }
 
-async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>, tx_watchers: Sender<WatcherMessage>, tx_webserv: Sender<WebServMessage>) -> std::io::Result<()> {
+async fn reload_web_server(addr: IpAddr, port: u16, state: Arc<RwLock<ServerState>>) {
+	let (tx_shutdown, rx_shutdown) = oneshot::channel();
+	let (tx_exited, rx_exited) = oneshot::channel();
+
+	let mut rx_tx_couple = Some((tx_shutdown, rx_exited));
+
+	std::mem::swap(&mut state.write().unwrap().shutdown_web_server_chan, &mut rx_tx_couple);
+
+	// shutdown the previous webserver
+	if let Some((tx, rx)) = rx_tx_couple {
+		tx.send(()).unwrap();
+		rx.await.unwrap();
+	}
+
+	let new_webserv_future = web_server(addr, port, state.clone());
+
+	// hot-reloading the web server is backed by the fact that dropping the web server future
+	// will shutdown it (see
+	// https://github.com/hyperium/hyper/blob/dd02254ae8c6c59432254a546bee6c9e95e16400/tests/server.rs#L1928-L1940
+	// for more info ?). To do so, we send a shutdown signal to the future containing the
+	// webserver. That future selects on the both the webserver future and the shutdown channel,
+	// and will exit upon such signal, dropping() the webserver on the way.
+	tokio::spawn(async move {
+		let mut new_webserv_future = Box::pin(new_webserv_future);
+		let mut rx_shutdown = Box::pin(rx_shutdown);
+		loop {
+			tokio::select! {
+				_ = &mut new_webserv_future => {},
+				_ = &mut rx_shutdown => {
+					// drop the previous webserver if any (should stop the web server)
+					std::mem::drop(new_webserv_future);
+					tx_exited.send(()).unwrap();
+					return;
+				}
+			}
+		}
+	});
+	println!("Listening endpoint set to {}:{}", addr, port);
+}
+
+async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>, tx_watchers: Sender<WatcherMessage>) -> std::io::Result<()> {
 	// Updating the list of websites to check (it should be noted that changing the
 	// http listening port or adress is not possible at runtime).
 	println!("Server reloading asked, let's see what we can do for you...");
@@ -470,41 +511,13 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 				x.enabled.store(false, Ordering::Release);
 			}
 		}
-		println!("Server reloading finished successfully with {} changes.", changes);
+		println!("Server reloading finished successfully with {} website changes.", changes);
 	};
 
-	if new_config.global.listen_port != old_config.global.listen_port
+	if state.read().unwrap().shutdown_web_server_chan.is_none()
+		|| new_config.global.listen_port != old_config.global.listen_port
 		|| new_config.global.listen_addr != old_config.global.listen_addr {
-
-		// shutdown the previous webserver
-		let mut rx_tx_couple = None;
-		std::mem::swap(&mut state.write().unwrap().shutdown_web_server_chan, &mut rx_tx_couple);
-		if let Some((tx, rx)) = rx_tx_couple {
-			tx.send(()).unwrap();
-			rx.await.unwrap();
-		}
-
-		let new_webserv_future = web_server(new_config.global.listen_addr, new_config.global.listen_port, state.clone(), tx_webserv);
-
-		let (tx_shutdown, rx_shutdown) = oneshot::channel();
-		let (tx_exited, rx_exited) = oneshot::channel();
-
-		state.write().unwrap().shutdown_web_server_chan = Some((tx_shutdown, rx_exited));
-		tokio::spawn(async move {
-			let mut new_webserv_future = Box::pin(new_webserv_future);
-			let mut rx_shutdown = Box::pin(rx_shutdown);
-			loop {
-				tokio::select! {
-					_ = &mut new_webserv_future => {},
-					_ = &mut rx_shutdown => {
-						// drop the previous webserver if any (should stop the web server)
-						std::mem::drop(new_webserv_future);
-						tx_exited.send(()).unwrap();
-						return;
-					}
-				}
-			}
-		});
+			reload_web_server(new_config.global.listen_addr, new_config.global.listen_port, state.clone()).await;
 	}
 	*old_config = new_config;
 
@@ -514,9 +527,8 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-	let state = ServerState::new_empty();
-
 	let mut config: Config = Config::default();
+
 	let (tx_watchers, rx_watchers)
 		: (crossbeam_channel::Sender<WatcherMessage>, crossbeam_channel::Receiver<WatcherMessage>)
 		= unbounded();
@@ -526,6 +538,8 @@ async fn main() -> std::io::Result<()> {
 	// setup and subsequent refreshes)
 	let (tx_webserv, rx_webserv) = unbounded();
 	tx_webserv.send(WebServMessage::ReloadConfig).unwrap();
+
+	let state = ServerState::new_empty(tx_webserv);
 
 	loop {
 		select! {
@@ -545,7 +559,7 @@ async fn main() -> std::io::Result<()> {
 			},
 			recv(rx_webserv) -> msg => match msg {
 				Ok(WebServMessage::ReloadConfig) =>
-					reload_config(&mut config, state.clone(), tx_watchers.clone(), tx_webserv.clone()).await?,
+					reload_config(&mut config, state.clone(), tx_watchers.clone()).await?,
 				Err(e) => {
 					eprintln!("{} error encountered while reading on the web server channel, exiting...", e);
 					panic!();
