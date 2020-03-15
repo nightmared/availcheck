@@ -8,6 +8,10 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::sync::oneshot;
 
 use crossbeam_channel::{unbounded, select, Sender};
 
@@ -271,7 +275,6 @@ enum WebServMessage {
 	ReloadConfig
 }
 
-
 fn run_query(url: &Url) -> MetricResult {
 	let stop;
 
@@ -328,10 +331,20 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 }
 
 struct ServerState {
-	internal: HashMap<Arc<Website>, MetricResult>
+	internal: HashMap<Arc<Website>, MetricResult>,
+	// the first element is a channel to ask the webserver to shutdown itself, and the second one
+	// is a receiver notified when the server is supposedly stopped
+	shutdown_web_server_chan: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>
 }
 
 impl ServerState {
+	fn new_empty() -> Arc<RwLock<Self>> {
+		Arc::new(RwLock::new(ServerState {
+			internal: HashMap::new(),
+			shutdown_web_server_chan: None
+		}))
+	}
+
 	fn add_metrics_to_string<T: std::fmt::Display>(&self, s: &mut String, name: &str, f: &dyn Fn(&MetricResult) -> Option<T>) {
 		for ws in self.internal.keys() {
 			match self.internal.get(ws) {
@@ -416,7 +429,7 @@ fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: S
 	Ok(())
 }
 
-fn reload_config(config: &mut Config, tx_watchers: Sender<WatcherMessage>) -> std::io::Result<()> {
+async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>, tx_watchers: Sender<WatcherMessage>, tx_webserv: Sender<WebServMessage>) -> std::io::Result<()> {
 	// Updating the list of websites to check (it should be noted that changing the
 	// http listening port or adress is not possible at runtime).
 	println!("Server reloading asked, let's see what we can do for you...");
@@ -430,26 +443,26 @@ fn reload_config(config: &mut Config, tx_watchers: Sender<WatcherMessage>) -> st
 	};
 
 
-	if new_config.global != config.global {
+	if new_config.global != old_config.global {
 		// disable every watcher and spawn new ones, as the global config changed, which may
 		// impact every watchers (in case a variable like "dns_refresh_time" changes)
 		// TODO: separate the webserver config from the one impacting the watchers to prevent too
 		// many restarts
-		for w in &config.websites {
+		for w in &old_config.websites {
 			w.enabled.store(false, Ordering::Release);
 		}
 		for w in &new_config.websites {
 			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone())?;
 		}
-		println!("Server fully reloaded.");
+
 	} else {
 		// enumerate the websites that should be added/deleted
-		let differences = new_config.websites.symmetric_difference(&config.websites);
+		let differences = new_config.websites.symmetric_difference(&old_config.websites);
 		// start/stop watchers accordingly
 		let mut changes = 0;
 		for x in differences {
 			changes += 1;
-			if !config.websites.contains(x) {
+			if !old_config.websites.contains(x) {
 				// website x has been added
 				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone())?;
 			} else {
@@ -460,34 +473,59 @@ fn reload_config(config: &mut Config, tx_watchers: Sender<WatcherMessage>) -> st
 		println!("Server reloading finished successfully with {} changes.", changes);
 	};
 
-	if new_config.global.listen_port != config.global.listen_port
-		|| new_config.global.listen_addr != config.global.listen_addr {
+	if new_config.global.listen_port != old_config.global.listen_port
+		|| new_config.global.listen_addr != old_config.global.listen_addr {
 
+		// shutdown the previous webserver
+		let mut rx_tx_couple = None;
+		std::mem::swap(&mut state.write().unwrap().shutdown_web_server_chan, &mut rx_tx_couple);
+		if let Some((tx, rx)) = rx_tx_couple {
+			tx.send(()).unwrap();
+			rx.await.unwrap();
+		}
+
+		let new_webserv_future = web_server(new_config.global.listen_addr, new_config.global.listen_port, state.clone(), tx_webserv);
+
+		let (tx_shutdown, rx_shutdown) = oneshot::channel();
+		let (tx_exited, rx_exited) = oneshot::channel();
+
+		state.write().unwrap().shutdown_web_server_chan = Some((tx_shutdown, rx_exited));
+		tokio::spawn(async move {
+			let mut new_webserv_future = Box::pin(new_webserv_future);
+			let mut rx_shutdown = Box::pin(rx_shutdown);
+			loop {
+				tokio::select! {
+					_ = &mut new_webserv_future => {},
+					_ = &mut rx_shutdown => {
+						// drop the previous webserver if any (should stop the web server)
+						std::mem::drop(new_webserv_future);
+						tx_exited.send(()).unwrap();
+						return;
+					}
+				}
+			}
+		});
 	}
-	*config = new_config;
+	*old_config = new_config;
+
+	println!("Server fully reloaded.");
 	Ok(())
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-	let mut config: Config = Config::default();
+	let state = ServerState::new_empty();
 
-	let (tx_watchers, rx_watchers): (crossbeam_channel::Sender<WatcherMessage>, crossbeam_channel::Receiver<WatcherMessage>) = unbounded();
-	let (tx_webserv, rx_webserv) = unbounded();
+	let mut config: Config = Config::default();
+	let (tx_watchers, rx_watchers)
+		: (crossbeam_channel::Sender<WatcherMessage>, crossbeam_channel::Receiver<WatcherMessage>)
+		= unbounded();
 
 	// force config reloading at startup
 	// (the main advanatge of this is that there is no substantial difference between the initial
 	// setup and subsequent refreshes)
+	let (tx_webserv, rx_webserv) = unbounded();
 	tx_webserv.send(WebServMessage::ReloadConfig).unwrap();
-
-	let state = Arc::new(RwLock::new(
-		ServerState { internal: HashMap::new() }));
-
-	let state_clone = state.clone();
-
-	let (listen_addr, listen_port) = (config.global.listen_addr, config.global.listen_port);
-
-	tokio::spawn(async move { web_server(listen_addr, listen_port, state_clone, tx_webserv).await });
 
 	loop {
 		select! {
@@ -506,7 +544,8 @@ async fn main() -> std::io::Result<()> {
 				}
 			},
 			recv(rx_webserv) -> msg => match msg {
-				Ok(WebServMessage::ReloadConfig) => reload_config(&mut config, tx_watchers.clone())?,
+				Ok(WebServMessage::ReloadConfig) =>
+					reload_config(&mut config, state.clone(), tx_watchers.clone(), tx_webserv.clone()).await?,
 				Err(e) => {
 					eprintln!("{} error encountered while reading on the web server channel, exiting...", e);
 					panic!();
