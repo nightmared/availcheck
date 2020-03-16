@@ -1,4 +1,5 @@
-use std::{env, thread, panic};
+use std::{env, thread};
+use std::panic::{self, AssertUnwindSafe};
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
@@ -15,9 +16,10 @@ use crossbeam_channel::{unbounded, select, Sender};
 
 use warp::Filter;
 
+use dns_lookup::lookup_host;
+
 use serde::{Deserialize, Deserializer};
 use serde::de;
-
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -69,6 +71,45 @@ fn default_enabled() -> AtomicBool {
 	AtomicBool::new(true)
 }
 
+fn resolve_host(host: &str) -> Option<IpAddr> {
+	host.parse().map_or_else(|_| {
+		lookup_host(host).map(|x| x.get(0).map(|x| *x)).unwrap_or(None)
+	}, |x| Some(x))
+}
+
+trait UrlQueryMaker {
+	type R;
+	type E;
+	fn internal_query(&self, ip: &Option<IpAddr>) -> Result<Self::R, Self::E>;
+	fn internal_resolve(&self) -> Option<IpAddr>;
+}
+
+trait Url {
+	fn query(&self, ip: &Option<IpAddr>) -> MetricResult;
+	fn resolve(&self) -> Option<IpAddr>;
+}
+
+impl<T> Url for T
+	where T: UrlQueryMaker,
+	Result<T::R, T::E>: Into<MetricResult> {
+
+	fn query(&self, ip: &Option<IpAddr>) -> MetricResult {
+		// this is far from ideal (we could be preempted after getting an answer and before reading
+		// the time) but atohttpc (and the likes) doesn't expose timing information so we have to restrict ourselves
+		// to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
+		let start = Instant::now();
+		let output: Result<T::R, T::E> = self.internal_query(&ip);
+		let stop = start.elapsed();
+
+		output.into().map_success(|x| x.response_time = Some(stop))
+	}
+
+	fn resolve(&self) -> Option<IpAddr> {
+		self.internal_resolve()
+	}
+}
+
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct HttpStruct {
 	query: String,
@@ -78,17 +119,29 @@ struct HttpStruct {
 	path: String
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum Url {
-	Http(HttpStruct)
+impl UrlQueryMaker for HttpStruct {
+	type R = attohttpc::Response;
+	type E = attohttpc::Error;
+
+	fn internal_query(&self, ip: &Option<IpAddr>) -> Result<Self::R, Self::E> {
+		attohttpc::RequestBuilder::try_new(attohttpc::Method::GET, &self.query)
+			.map(|x|
+				x.timeout(Duration::new(7, 0))
+				.header(attohttpc::header::HeaderName::from_static("host"), attohttpc::header::HeaderValue::from_str(&self.host).unwrap())
+			)
+			.unwrap()
+			.send()
+	}
+
+	fn internal_resolve(&self) -> Option<IpAddr> {
+		resolve_host(&self.host)
+	}
 }
-
-
 
 struct UrlVisitor;
 
 impl<'de> de::Visitor<'de> for UrlVisitor {
-	type Value = Url;
+	type Value = Box<dyn Url + Send + Sync>;
 
 	fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
 		formatter.write_str("an url matching scheme://host:port/path")
@@ -111,7 +164,7 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 		let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
 		match scheme_and_remainder[0] {
 			"http" | "https" =>
-				Ok(Url::Http(HttpStruct {
+				Ok(Box::new(HttpStruct {
 					query: value.into(),
 					tls_enabled: scheme_and_remainder[0] == "https",
 					port: host_and_port
@@ -127,8 +180,8 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 	}
 }
 
-impl<'de> Deserialize<'de> for Url {
-	fn deserialize<D>(deserializer: D) -> Result<Url, D::Error>
+impl<'de> Deserialize<'de> for Box<dyn Url + Send + Sync> {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
 	where
 		D: Deserializer<'de>,
 	{
@@ -137,12 +190,11 @@ impl<'de> Deserialize<'de> for Url {
 }
 
 
-
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 struct Website {
 	// TODO: sanitize this field
 	name: String,
-	url: Url,
+	url: Box<dyn Url + Send + Sync>,
 	#[serde(default="default_checktime")]
 	check_time_seconds: u64,
 	#[serde(skip_deserializing, default = "default_enabled")]
@@ -152,14 +204,14 @@ struct Website {
 
 impl std::hash::Hash for Website {
 	fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
-		self.url.hash(hasher);
+		self.name.hash(hasher);
 	}
 }
 
 // We cannot simply derive that since AtomicBool is not comparable
 impl PartialEq for Website {
 	fn eq(&self, other: &Self) -> bool {
-		self.url == other.url
+		self.name == other.name
 	}
 }
 impl Eq for Website {}
@@ -262,7 +314,7 @@ enum WebsiteMessageType {
 	Exit
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct WatcherMessage {
 	website: Arc<Website>,
 	msg: WebsiteMessageType
@@ -273,33 +325,11 @@ enum WebServMessage {
 	ReloadConfig
 }
 
-fn run_query(url: &Url) -> MetricResult {
-	let stop;
-
-	MetricResult::from({
-		// this is far from ideal (we could be preempted after getting an answer and before reading
-		// the time) but atohttpc doesn't expose timing information so we have to restrict ourselves
-		// to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
-		let start = Instant::now();
-		let output = match url {
-			Url::Http(http_opts) => {
-				attohttpc::RequestBuilder::try_new(attohttpc::Method::GET, &http_opts.query)
-					.map(|x|
-						x.timeout(Duration::new(7, 0))
-						.header(attohttpc::header::HeaderName::from_static("host"), attohttpc::header::HeaderValue::from_str(&http_opts.host).unwrap())
-					)
-					.unwrap()
-					.send()
-			}
-		};
-		stop = start.elapsed();
-		output
-	}).map_success(|x| x.response_time = Some(stop))
-}
-
 fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
 	let mut dns_resolution_start = Instant::now();
+	// we cache the dns result so as to not spam our DNS resolver
+	let mut ip = ws.url.resolve();
 	loop {
 		let start = Instant::now();
 		if !ws.enabled.load(Ordering::Acquire) {
@@ -310,9 +340,13 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 			return;
 		}
 		if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
+			ip = ws.url.resolve();
+			// let's reset the dns counter
+			dns_resolution_start = Instant::now();
 		}
 
-		let res = match panic::catch_unwind(|| run_query(&ws.url)) {
+		let ws_wrapper = AssertUnwindSafe(&ws.url);
+		let res = match panic::catch_unwind(move || ws_wrapper.query(&ip) ) {
 			Ok(x) => x,
 			Err(_) => MetricResult::Error
 		};
@@ -460,6 +494,8 @@ async fn reload_web_server(addr: IpAddr, port: u16, state: Arc<RwLock<ServerStat
 				_ = &mut new_webserv_future => {},
 				_ = &mut rx_shutdown => {
 					// drop the previous webserver if any (should stop the web server)
+					// TODO: make sure that any ongoing connections are dropped (so that the socket
+					// doesn't end up in TIME_WAIT) before send the 'exited' signal
 					std::mem::drop(new_webserv_future);
 					tx_exited.send(()).unwrap();
 					return;
@@ -482,6 +518,8 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			return Ok(());
 		}
 	};
+
+	// TODO: check that there isn't multiple websites with the same name
 
 
 	if new_config.global != old_config.global {
