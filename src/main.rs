@@ -1,14 +1,13 @@
 use std::{env, thread};
 use std::panic::{self, AssertUnwindSafe};
-use std::fs::File;
-use std::io::prelude::*;
+use std::io::{self, prelude::*};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, Duration};
-use std::collections::HashMap;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+use std::fs::File;
 
 use tokio::sync::oneshot;
 
@@ -21,6 +20,8 @@ use dns_lookup::lookup_host;
 use serde::{Deserialize, Deserializer};
 use serde::de;
 
+// TODO: add logging
+
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
 		.unwrap_or(env::var_os("HOME")
@@ -30,15 +31,7 @@ fn get_base_dir() -> PathBuf {
 	Path::new(&config_base_dir).join("availcheck/")
 }
 
-pub fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-	let mut config_file_path = get_base_dir();
-	config_file_path.push(file_name);
-	// if your filename is not a valid utf-8 name, it's YOUR problem (like using a weird path and/or a
-	// weird OS)
-	load_yaml_file(&config_file_path.to_string_lossy())
-}
-
-pub fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
 	let mut fs = File::open(file_name).map_err(|e| {
 		eprintln!("Unable to open the file '{}'.", file_name);
 		e
@@ -47,9 +40,55 @@ pub fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::
 	fs.read_to_end(&mut conf_buf)?;
 	serde_yaml::from_slice::<T>(&conf_buf).map_err(|e| {
 		eprintln!("Unable to parse the file '{}': {:?}", file_name, e);
-		std::io::Error::from(std::io::ErrorKind::InvalidData)
+		io::Error::from(io::ErrorKind::InvalidData)
 	})
 }
+
+fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+	let mut config_file_path = get_base_dir();
+	config_file_path.push(file_name);
+	// if your filename is not a valid utf-8 name, it's YOUR problem (like using a weird path
+	// and/or doing weird things).
+	// TODO: look into OsStr
+	load_yaml_file(&config_file_path.to_string_lossy())
+}
+
+// This function only works if you give it a sorted list
+fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
+	let mut duplicates = HashSet::new();
+	for i in 1..sorted_vec.len() {
+		if sorted_vec[i-1] == sorted_vec[i] {
+			duplicates.insert(sorted_vec[i].as_ref());
+		}
+	}
+	duplicates
+}
+
+
+fn load_config() -> std::io::Result<Config> {
+	let conf = load_app_data("config.yml");
+
+	conf.map(|conf: SerializedConfig| {
+		let mut names = conf.websites
+			.iter()
+			.map(|x| &x.name)
+			.collect::<Vec<&String>>();
+		names.sort();
+		let duplicates = get_duplicates(&names);
+		if duplicates.len() != 0 {
+			return Err(io::Error::new(io::ErrorKind::InvalidData,
+				format!("Duplicate names in your config file: {:?}", duplicates)));
+		}
+
+		Ok(Config {
+			websites: conf.websites
+				.into_iter()
+				.collect(),
+			global: conf.global
+		})
+	}).map_or_else(|e| Err(e), |x| x)
+}
+
 
 fn default_checktime() -> u64 {
 	15
@@ -237,10 +276,16 @@ impl Default for GlobalConfig {
 }
 
 
-#[derive(Deserialize, PartialEq)]
+#[derive(Deserialize)]
+struct SerializedConfig {
+	websites: Vec<Arc<Website>>,
+	#[serde(flatten)]
+	global: Arc<GlobalConfig>
+}
+
+#[derive(PartialEq)]
 struct Config {
 	websites: HashSet<Arc<Website>>,
-	#[serde(flatten)]
 	global: Arc<GlobalConfig>
 }
 
@@ -511,15 +556,13 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 	// http listening port or adress is not possible at runtime).
 	println!("Server reloading asked, let's see what we can do for you...");
 	// reload the config
-	let new_config: Config = match load_app_data("config.yml") {
+	let new_config: Config = match load_config() {
 		Ok(x) => x,
 		Err(e) => {
 			eprintln!("Looks like your config file is invalid, aborting the procedure: {}", e);
 			return Ok(());
 		}
 	};
-
-	// TODO: check that there isn't multiple websites with the same name
 
 
 	if new_config.global != old_config.global {
