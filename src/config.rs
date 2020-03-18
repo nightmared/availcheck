@@ -10,7 +10,7 @@ use std::env;
 use serde::{Deserialize, Deserializer};
 use serde::de;
 
-use crate::query_providers::{Url, HttpStruct};
+use crate::query_providers::Url;
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -104,7 +104,7 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 
 		let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
 		match scheme_and_remainder[0] {
-			"http" | "https" =>
+			/*"http" | "https" =>
 				Ok(Box::new(HttpStruct {
 					query: value.into(),
 					tls_enabled: scheme_and_remainder[0] == "https",
@@ -115,7 +115,7 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 					,
 					host: host_and_port[0].into(),
 					path
-				})),
+				})),*/
 			_ => Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self))
 		}
 	}

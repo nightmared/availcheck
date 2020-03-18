@@ -10,5 +10,6 @@ serde_yaml = "0.8"
 tokio = { version = "0.2.13", features = ["macros", "rt-threaded", "sync"] }
 warp = "0.2"
 crossbeam-channel = "0.4.2"
-attohttpc = "0.11.1"
-dns-lookup = "1.0.1"
+c-ares-resolver = "7.0"
+hyper = "0.13"
+async-trait = "0.1.24"

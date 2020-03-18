@@ -10,16 +10,6 @@ pub struct MetricData {
 	pub response_size: Option<u64>
 }
 
-impl From<attohttpc::Response> for MetricData {
-	fn from(handle: attohttpc::Response) -> MetricData {
-		MetricData {
-			status_code: Some(handle.status().as_u16()),
-			response_time: None,
-			response_size: Some(handle.bytes().unwrap().len() as u64)
-		}
-	}
-}
-
 #[derive(Debug, PartialEq)]
 pub enum MetricResult {
 	Success(MetricData),
@@ -37,26 +27,6 @@ impl MetricResult {
 		self
 	}
 }
-
-impl From<Result<attohttpc::Response, attohttpc::Error>> for MetricResult  {
-	fn from(res: Result<attohttpc::Response, attohttpc::Error>) -> MetricResult {
-		match res {
-			Ok(res) => MetricResult::Success(MetricData::from(res)),
-			Err(e) => {
-				if let attohttpc::ErrorKind::Io(e) = e.kind() {
-					if e.kind() == std::io::ErrorKind::TimedOut {
-						MetricResult::Timeout
-					} else {
-						MetricResult::Error
-					}
-				} else {
-					MetricResult::Error
-				}
-			}
-		}
-	}
-}
-
 
 #[derive(Debug, PartialEq)]
 pub enum WebsiteMessageType {
