@@ -1,11 +1,11 @@
-use std::thread;
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, Duration};
+use std::time::Duration;
 use std::net::{SocketAddr, IpAddr};
 use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 
 use tokio::sync::oneshot;
+use tokio::time::delay_for;
 
 use crossbeam_channel::{unbounded, select, Sender};
 
@@ -13,6 +13,7 @@ use warp::Filter;
 
 
 mod config;
+mod errors;
 mod metrics;
 mod query_providers;
 use config::{Config, GlobalConfig, Website, load_config};
@@ -24,7 +25,8 @@ use metrics::{WatcherMessage, WebServMessage, WebsiteMessageType, MetricResult};
 async fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
 	loop {
-		let start = Instant::now();
+		let delay = delay_for(wait_time);
+
 		if !ws.enabled.load(Ordering::Acquire) {
 			send_queue.send(WatcherMessage {
 				website: ws,
@@ -39,10 +41,8 @@ async fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_q
 			website: ws.clone(),
 			msg: WebsiteMessageType::MetricResult(res)
 		}).unwrap();
-		// the 'while' loop prevents against spurious wakeups
-		while start.elapsed() < wait_time {
-			thread::sleep(wait_time-start.elapsed());
-		}
+
+		delay.await;
 	}
 }
 

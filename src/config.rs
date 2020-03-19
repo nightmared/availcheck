@@ -10,7 +10,7 @@ use std::env;
 use serde::{Deserialize, Deserializer};
 use serde::de;
 
-use crate::query_providers::Url;
+use crate::query_providers::{Url, HttpStruct, UrlWrapper};
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -104,8 +104,8 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 
 		let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
 		match scheme_and_remainder[0] {
-			/*"http" | "https" =>
-				Ok(Box::new(HttpStruct {
+			"http" | "https" =>
+				Ok(Box::new(UrlWrapper::new(HttpStruct {
 					query: value.into(),
 					tls_enabled: scheme_and_remainder[0] == "https",
 					port: host_and_port
@@ -115,7 +115,7 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 					,
 					host: host_and_port[0].into(),
 					path
-				})),*/
+				}, default_dns_refresh_time()))), // TODO: pass the custom alue provided by the config file, if any
 			_ => Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self))
 		}
 	}
