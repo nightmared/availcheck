@@ -21,17 +21,8 @@ use metrics::{WatcherMessage, WebServMessage, WebsiteMessageType, MetricResult};
 // TODO: add logging
 
 
-struct WebsiteChecker {
-	global_config: Arc<GlobalConfig>,
-	website: Arc<Website>,
-	notification_queue: Sender<WatcherMessage>
-}
-
 async fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
-	let mut dns_resolution_start = Instant::now();
-	// we cache the dns result so as to not spam our DNS resolver
-	let mut ip = ws.url.resolve().await;
 	loop {
 		let start = Instant::now();
 		if !ws.enabled.load(Ordering::Acquire) {
@@ -41,13 +32,8 @@ async fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_q
 			}).unwrap();
 			return;
 		}
-		if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
-			ip = ws.url.resolve().await;
-			// let's reset the dns counter
-			dns_resolution_start = Instant::now();
-		}
 
-		let res = ws.url.query(&ip).await;
+		let res = ws.url.query().await;
 
 		send_queue.send(WatcherMessage {
 			website: ws.clone(),
@@ -223,7 +209,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			w.enabled.store(false, Ordering::Release);
 		}
 		for w in &new_config.websites {
-			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone());
+			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone()).await;
 		}
 
 	} else {
@@ -235,7 +221,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			changes += 1;
 			if !old_config.websites.contains(x) {
 				// website x has been added
-				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone());
+				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone()).await;
 			} else {
 				// website x has been deleted
 				x.enabled.store(false, Ordering::Release);
