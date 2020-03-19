@@ -10,7 +10,7 @@ use std::env;
 use serde::{Deserialize, Deserializer};
 use serde::de;
 
-use crate::query_providers::{Url, HttpStruct, UrlWrapper};
+use crate::query_providers::{Url, HttpStruct, HttpWrapper};
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -96,25 +96,11 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 		if scheme_and_remainder.len() != 2 {
 			return Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self));
 		}
-		let host_and_path: Vec<&str> = scheme_and_remainder[1].splitn(2, '/').collect();
-		let path = host_and_path
-			.get(1)
-			.and_then(|&x| Some(x.into()))
-			.unwrap_or(String::new());
 
-		let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
 		match scheme_and_remainder[0] {
 			"http" | "https" =>
-				Ok(Box::new(UrlWrapper::new(HttpStruct {
-					query: value.into(),
-					tls_enabled: scheme_and_remainder[0] == "https",
-					port: host_and_port
-							.get(1)
-							.and_then(|x| str::parse::<u16>(x).ok())
-							.unwrap_or_else(|| if scheme_and_remainder[0] == "https" { 443 } else { 80 })
-					,
-					host: host_and_port[0].into(),
-					path
+				Ok(Box::new(HttpWrapper::new(HttpStruct {
+					query: value.into()
 				}, default_dns_refresh_time()))), // TODO: pass the custom alue provided by the config file, if any
 			_ => Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self))
 		}

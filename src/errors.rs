@@ -3,7 +3,10 @@
 pub enum Error {
 	Hyper(hyper::Error),
 	Serde(serde_yaml::Error),
-	Timeout(tokio::time::Elapsed)
+	Timeout(tokio::time::Elapsed),
+	InvalidUri(http::uri::InvalidUri),
+	InvalidRequest(http::Error),
+	ResolutionFailed
 }
 
 impl std::fmt::Display for Error {
@@ -17,7 +20,10 @@ impl std::error::Error for Error {
 		match self {
 			Error::Hyper(e) => Some(e),
 			Error::Serde(e) => Some(e),
-			Error::Timeout(e) => Some(e)
+			Error::Timeout(e) => Some(e),
+			Error::InvalidUri(e) => Some(e),
+			Error::InvalidRequest(e) => Some(e),
+			Error::ResolutionFailed => None
 		}
     }
 }
@@ -40,3 +46,20 @@ impl From<tokio::time::Elapsed> for Error {
 	}
 }
 
+impl From<http::uri::InvalidUri> for Error {
+	fn from(val: http::uri::InvalidUri) -> Self {
+		Error::InvalidUri(val)
+	}
+}
+
+impl From<http::Error> for Error {
+	fn from(val: http::Error) -> Self {
+		Error::InvalidRequest(val)
+	}
+}
+
+impl From<c_ares::Error> for Error {
+	fn from(val: c_ares::Error) -> Self {
+		Error::ResolutionFailed
+	}
+}
