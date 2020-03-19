@@ -2,12 +2,11 @@ use std::time::{Instant, Duration};
 use std::task::{Context, Poll};
 use std::future::Future;
 use std::pin::Pin;
-use std::borrow::Cow;
 use std::net::IpAddr;
 
 use c_ares_resolver::FutureResolver;
 use async_trait::async_trait;
-use hyper::client::{ResponseFuture, connect::dns::Name};
+use hyper::client::{Client, HttpConnector, ResponseFuture, connect::dns::Name};
 use hyper::service::{Service, service_fn};
 use hyper::{Body, Request};
 
@@ -30,26 +29,26 @@ async fn resolve_host(host: &str) -> Option<IpAddr> {
 }
 
 #[derive(Clone)]
-struct DnsResolver<'a> {
-	host: &'a str,
+pub struct DnsResolver {
+	host: String,
 	last_resolution_time: Option<Instant>,
 	refresh_frequency: Duration,
 	last_answer: Option<IpAddr>
 }
 
-impl<'a> Service<Name> for DnsResolver<'a> {
+impl Service<Name> for DnsResolver {
 	type Response = std::option::IntoIter<IpAddr>;
 	type Error = std::io::Error;
-	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'a>>;
+	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		Poll::Ready(Ok(()))
     }
 
 	fn call(&mut self, name: Name) -> Self::Future {
 		// some safety check
 		assert!(name.as_str() == self.host);
-		Box::pin(async {
+		Box::pin(async move {
 			// we cache the dns result so as to not spam our DNS resolver
 			// TODO: add caching at this layer
 			Ok(resolve_host(name.as_str()).await.into_iter())
@@ -70,11 +69,12 @@ pub trait UrlQueryMaker {
 	type E;
 	async fn internal_query(&self) -> Result<Self::R, Self::E>;
 	fn gen_resolver(&self, refresh_frequency: Duration) -> DnsResolver;
+	fn gen_client(&self, resolver: DnsResolver) -> Client<HttpConnector<DnsResolver>, Body>;
 }
 
 #[async_trait]
 pub trait Url {
-	async fn query<'a>(&self) -> MetricResult;
+	async fn query(&self) -> MetricResult;
 }
 
 #[async_trait]
@@ -83,7 +83,7 @@ impl<T> Url for T
 	T: Sync,
 	Result<T::R, T::E>: Into<MetricResult> {
 
-	async fn query<'a>(&self) -> MetricResult {
+	async fn query(&self) -> MetricResult {
 		// this is far from ideal (we could be preempted after getting an answer and before reading
 		// the time) but atohttpc (and the likes) doesn't expose timing information so we have to restrict ourselves
 		// to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
@@ -97,31 +97,31 @@ impl<T> Url for T
 	}
 }
 
-pub struct UrlWrapper<'a, T: 'a> {
+pub struct UrlWrapper<T> {
 	inner: T,
-	dns_resolver: DnsResolver<'a>
+	client: Client<HttpConnector<DnsResolver>, Body>
 }
 
-impl<'a, T: std::cmp::Eq + std::hash::Hash> std::hash::Hash for UrlWrapper<'a, T> {
+impl<T: std::cmp::Eq + std::hash::Hash> std::hash::Hash for UrlWrapper<T> {
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		self.inner.hash(state);
 	}
 }
 
-impl<'a, T: std::cmp::Eq> PartialEq for UrlWrapper<'a, T> {
-	fn eq(&self, other: &UrlWrapper<'a, T>) -> bool {
+impl<T: std::cmp::Eq> PartialEq for UrlWrapper<T> {
+	fn eq(&self, other: &UrlWrapper<T>) -> bool {
 		self.inner == other.inner
 	}
 }
 
-impl<'a, T: std::cmp::Eq> std::cmp::Eq for UrlWrapper<'a, T> {}
+impl<T: std::cmp::Eq> std::cmp::Eq for UrlWrapper<T> {}
 
-
-impl<'a, T, R, E> UrlWrapper<'a, T> where T: Url + UrlQueryMaker<R=R, E=E> + PartialEq + Eq + std::hash::Hash {
+impl<T> UrlWrapper<T> where T: Url + UrlQueryMaker + PartialEq + Eq + std::hash::Hash {
 	fn new(v: T, dns_refresh_time: Duration) -> Self {
+		let client = v.gen_client(v.gen_resolver(dns_refresh_time));
 		UrlWrapper {
 			inner: v,
-			dns_resolver: v.gen_resolver(dns_refresh_time)
+			client
 		}
 	}
 }
@@ -137,18 +137,16 @@ pub struct HttpStruct {
 }
 
 #[async_trait]
-impl<'a> UrlQueryMaker for UrlWrapper<'a, HttpStruct> {
+impl UrlQueryMaker for UrlWrapper<HttpStruct> {
 	type R = hyper::Response<Vec<u8>>;
 	type E = hyper::Error;
 
-	async fn internal_query(&'a self) -> Result<Self::R, Self::E> {
-		let client = hyper::Client::builder()
-			.build(hyper::client::HttpConnector::new_with_resolver(self.dns_resolver));
-		let req = Request::get(self.inner.query)
+	async fn internal_query(&self) -> Result<Self::R, Self::E> {
+		let req = Request::get(&self.inner.query)
 			.header("User-Agent", "monitoring/availcheck")
 			.body(Body::empty())
 			.unwrap();
-		client.request(req).await;
+		self.client.request(req).await;
 		unimplemented!()
 		/*attohttpc::RequestBuilder::try_new(attohttpc::Method::GET, &query)
 			.map(|x|
@@ -162,11 +160,16 @@ impl<'a> UrlQueryMaker for UrlWrapper<'a, HttpStruct> {
 
 	fn gen_resolver(&self, refresh_frequency: Duration) -> DnsResolver {
 		DnsResolver {
-			host: &self.inner.host,
+			host: self.inner.host.clone(),
 			last_resolution_time: None,
 			refresh_frequency,
 			last_answer: None
 		}
+	}
+
+	fn gen_client(&self, resolver: DnsResolver) -> Client<HttpConnector<DnsResolver>, Body> {
+		hyper::Client::builder()
+			.build(HttpConnector::new_with_resolver(resolver))
 	}
 }
 
