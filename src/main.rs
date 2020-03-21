@@ -191,7 +191,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 	// http listening port or adress is not possible at runtime).
 	println!("Server reloading asked, let's see what we can do for you...");
 	// reload the config
-	let new_config: Config = match load_config() {
+	let new_config: Config = match load_config().await {
 		Ok(x) => x,
 		Err(e) => {
 			eprintln!("Looks like your config file is invalid, aborting the procedure: {}", e);

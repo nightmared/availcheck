@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_yaml = "0.8"
-tokio = { version = "0.2.13", features = ["macros", "rt-threaded", "sync", "time"] }
+tokio = { version = "0.2.13", features = ["macros", "rt-threaded", "sync", "time", "fs"] }
 warp = "0.2"
 crossbeam-channel = "0.4.2"
 c-ares-resolver = "7.0"

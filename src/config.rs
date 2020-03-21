@@ -1,16 +1,17 @@
-use std::io::{self, prelude::*};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr};
-use std::fs::File;
 use std::env;
+use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 use serde::de;
+use tokio::fs;
 
-use crate::query_providers::{Url, HttpStruct, HttpWrapper};
+use crate::query_providers::{Url, HttpStruct, HttpWrapper, DnsResolverServer};
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -21,26 +22,21 @@ fn get_base_dir() -> PathBuf {
 	Path::new(&config_base_dir).join("availcheck/")
 }
 
-fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-	let mut fs = File::open(file_name).map_err(|e| {
-		eprintln!("Unable to open the file '{}'.", file_name);
-		e
-	})?;
-	let mut conf_buf = Vec::new();
-	fs.read_to_end(&mut conf_buf)?;
-	serde_yaml::from_slice::<T>(&conf_buf).map_err(|e| {
+async fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+	let file_content = fs::read_to_string(file_name).await?;
+	serde_yaml::from_str::<T>(&file_content).map_err(|e| {
 		eprintln!("Unable to parse the file '{}': {:?}", file_name, e);
 		io::Error::from(io::ErrorKind::InvalidData)
 	})
 }
 
-fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+async fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
 	let mut config_file_path = get_base_dir();
 	config_file_path.push(file_name);
 	// if your filename is not a valid utf-8 name, it's YOUR problem (like using a weird path
 	// and/or doing weird things).
 	// TODO: look into OsStr
-	load_yaml_file(&config_file_path.to_string_lossy())
+	load_yaml_file(&config_file_path.to_string_lossy()).await
 }
 
 // This function only works if you give it a sorted list
@@ -55,28 +51,32 @@ fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
 }
 
 
-pub fn load_config() -> std::io::Result<Config> {
-	let conf = load_app_data("config.yml");
+pub async fn load_config() -> std::io::Result<Config> {
+	let conf: SerializedConfig = load_app_data("config.yml").await?;
 
-	conf.map(|conf: SerializedConfig| {
-		let mut names = conf.websites
-			.iter()
-			.map(|x| &x.name)
-			.collect::<Vec<&String>>();
-		names.sort();
-		let duplicates = get_duplicates(&names);
-		if duplicates.len() != 0 {
-			return Err(io::Error::new(io::ErrorKind::InvalidData,
-				format!("Duplicate names in your config file: {:?}", duplicates)));
-		}
+	let mut dns_resolver = DnsResolverServer::new(Duration::new(conf.global.dns_refresh_time_seconds, 0));
 
-		Ok(Config {
-			websites: conf.websites
-				.into_iter()
-				.collect(),
-			global: conf.global
-		})
-	}).map_or_else(|e| Err(e), |x| x)
+	let mut names = conf.websites
+		.iter()
+		.map(|x| &x.name)
+		.collect::<Vec<&String>>();
+	names.sort();
+	let duplicates = get_duplicates(&names);
+	if duplicates.len() != 0 {
+		return Err(io::Error::new(io::ErrorKind::InvalidData,
+			format!("Duplicate names in your config file: {:?}", duplicates)));
+	}
+
+	Ok(Config {
+		websites: conf.websites
+			.into_iter()
+			.map(|mut x| {
+				let (tx, rx) = dns_resolver.add_client();
+				x.url.gen_client(tx, rx);
+				Arc::new(x)
+			}).collect(),
+		global: conf.global
+	})
 }
 
 struct UrlVisitor;
@@ -101,7 +101,7 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 			"http" | "https" =>
 				Ok(Box::new(HttpWrapper::new(HttpStruct {
 					query: value.into()
-				}, default_dns_refresh_time()))), // TODO: pass the custom alue provided by the config file, if any
+				}))),
 			_ => Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self))
 		}
 	}
@@ -166,7 +166,7 @@ impl Default for GlobalConfig {
 
 #[derive(Deserialize)]
 struct SerializedConfig {
-	websites: Vec<Arc<Website>>,
+	websites: Vec<Website>,
 	#[serde(flatten)]
 	global: Arc<GlobalConfig>
 }
