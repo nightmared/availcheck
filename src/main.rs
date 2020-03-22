@@ -16,13 +16,13 @@ mod config;
 mod errors;
 mod metrics;
 mod query_providers;
-use config::{Config, GlobalConfig, Website, load_config};
+use config::{Config, Website, load_config};
 use metrics::{WatcherMessage, WebServMessage, WebsiteMessageType, MetricResult};
 
 // TODO: add logging
 
 
-async fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
+async fn loop_website(ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
 	loop {
 		let delay = delay_for(wait_time);
@@ -139,9 +139,9 @@ async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<Ser
 	warp::serve(routes).run(SocketAddr::from((listen_addr, listen_port))).await
 }
 
-async fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<WatcherMessage>) {
+async fn spawn_watcher(website: &Arc<Website>, tx: Sender<WatcherMessage>) {
 	println!("Watching {}", website.name);
-	tokio::spawn(loop_website(global_config.clone(), website.clone(), tx));
+	tokio::spawn(loop_website(website.clone(), tx));
 }
 
 async fn reload_web_server(addr: IpAddr, port: u16, state: Arc<RwLock<ServerState>>) {
@@ -209,7 +209,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			w.enabled.store(false, Ordering::Release);
 		}
 		for w in &new_config.websites {
-			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone()).await;
+			spawn_watcher(&w, tx_watchers.clone()).await;
 		}
 
 	} else {
@@ -221,7 +221,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			changes += 1;
 			if !old_config.websites.contains(x) {
 				// website x has been added
-				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone()).await;
+				spawn_watcher(x, tx_watchers.clone()).await;
 			} else {
 				// website x has been deleted
 				x.enabled.store(false, Ordering::Release);

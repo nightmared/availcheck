@@ -48,11 +48,10 @@ pub struct DnsResolverInner {
 
 // garbage collection of hosts is ensured at reloading (reloading generates a new
 // DnsResolverServer), and restart resolving from scratch
-// TODO: stop old DnsResolverServer upon reloading
 pub struct DnsResolverServer {
 	hosts: Mutex<HashMap<String, DnsResolverInner>>,
 	refresh_frequency: Duration,
-	// TODO: one mutex per clientcan lead to some significant memory overhead
+	// TODO: one mutex per client can lead to some significant memory overhead
 	clients: Vec<Mutex<(Receiver<Name>, Sender<Option<IpAddr>>)>>
 }
 
@@ -90,6 +89,7 @@ impl DnsResolverServer {
 			if inner.last_resolution_time.elapsed() < self.refresh_frequency {
 				let mut client = self.clients.get(i).unwrap().lock().await;
 				client.1.send(Some(inner.last_answer)).await.unwrap();
+				return;
 			}
 		}
 		match resolve_host(host.as_str()).await {
@@ -131,6 +131,7 @@ impl DnsResolverServer {
 
 					self.resolve(msg, idx).await;
 				}, Err(()) => {
+					// return when all channels are closed
 					return;
 				}
 			}
@@ -215,7 +216,7 @@ impl Service<Name> for DnsResolverClient {
 		};
 
 		Box::pin(async move {
-			let send = sender.send(name).await?;
+			sender.send(name).await?;
 			let recv = receiver.recv();
 			match recv.await.unwrap_or(None).map(|x| std::iter::once(x)) {
 				Some(x) => Ok(x),
@@ -321,7 +322,8 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
 			.body(Body::empty())?;
 		let mut client = self.client.as_ref().unwrap().lock().await;
 		let timeout = tokio::time::timeout(Duration::new(7, 0), do_http_query(&mut client, req));
-		match timeout.await {
+		let res = timeout.await;
+		match res {
 			Ok(Ok(x)) => Ok(x),
 			Ok(Err(e)) => Err(e.into()),
 			Err(e) => Err(e.into())
