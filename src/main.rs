@@ -1,12 +1,11 @@
-use std::thread;
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, Duration};
+use std::time::Duration;
 use std::net::{SocketAddr, IpAddr};
 use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 
 use tokio::sync::oneshot;
+use tokio::time::delay_for;
 
 use crossbeam_channel::{unbounded, select, Sender};
 
@@ -14,21 +13,20 @@ use warp::Filter;
 
 
 mod config;
+mod errors;
 mod metrics;
 mod query_providers;
-use config::{Config, GlobalConfig, Website, load_config};
+use config::{Config, Website, load_config};
 use metrics::{WatcherMessage, WebServMessage, WebsiteMessageType, MetricResult};
 
 // TODO: add logging
 
 
-fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
+async fn loop_website(ws: Arc<Website>, send_queue: Sender<WatcherMessage>) {
 	let wait_time = Duration::new(ws.check_time_seconds, 0);
-	let mut dns_resolution_start = Instant::now();
-	// we cache the dns result so as to not spam our DNS resolver
-	let mut ip = ws.url.resolve();
 	loop {
-		let start = Instant::now();
+		let delay = delay_for(wait_time);
+
 		if !ws.enabled.load(Ordering::Acquire) {
 			send_queue.send(WatcherMessage {
 				website: ws,
@@ -36,26 +34,15 @@ fn loop_website(global_config: Arc<GlobalConfig>, ws: Arc<Website>, send_queue: 
 			}).unwrap();
 			return;
 		}
-		if dns_resolution_start.elapsed() > Duration::new(global_config.dns_refresh_time_seconds, 0) {
-			ip = ws.url.resolve();
-			// let's reset the dns counter
-			dns_resolution_start = Instant::now();
-		}
 
-		let ws_wrapper = AssertUnwindSafe(&ws.url);
-		let res = match panic::catch_unwind(move || ws_wrapper.query(&ip) ) {
-			Ok(x) => x,
-			Err(_) => MetricResult::Error
-		};
+		let res = ws.url.query().await;
 
 		send_queue.send(WatcherMessage {
 			website: ws.clone(),
 			msg: WebsiteMessageType::MetricResult(res)
 		}).unwrap();
-		// the 'while' loop prevents against spurious wakeups
-		while start.elapsed() < wait_time {
-			thread::sleep(wait_time-start.elapsed());
-		}
+
+		delay.await;
 	}
 }
 
@@ -152,13 +139,9 @@ async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<RwLock<Ser
 	warp::serve(routes).run(SocketAddr::from((listen_addr, listen_port))).await
 }
 
-fn spawn_watcher(global_config: Arc<GlobalConfig>, website: &Arc<Website>, tx: Sender<WatcherMessage>) -> std::io::Result<()> {
+async fn spawn_watcher(website: &Arc<Website>, tx: Sender<WatcherMessage>) {
 	println!("Watching {}", website.name);
-	let website = website.clone();
-	thread::Builder::new()
-		.name(format!("Q_{}", website.name))
-		.spawn(move || loop_website(global_config.clone(), website, tx))?;
-	Ok(())
+	tokio::spawn(loop_website(website.clone(), tx));
 }
 
 async fn reload_web_server(addr: IpAddr, port: u16, state: Arc<RwLock<ServerState>>) {
@@ -208,7 +191,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 	// http listening port or adress is not possible at runtime).
 	println!("Server reloading asked, let's see what we can do for you...");
 	// reload the config
-	let new_config: Config = match load_config() {
+	let new_config: Config = match load_config().await {
 		Ok(x) => x,
 		Err(e) => {
 			eprintln!("Looks like your config file is invalid, aborting the procedure: {}", e);
@@ -226,7 +209,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			w.enabled.store(false, Ordering::Release);
 		}
 		for w in &new_config.websites {
-			spawn_watcher(new_config.global.clone(), &w, tx_watchers.clone())?;
+			spawn_watcher(&w, tx_watchers.clone()).await;
 		}
 
 	} else {
@@ -238,7 +221,7 @@ async fn reload_config(old_config: &mut Config, state: Arc<RwLock<ServerState>>,
 			changes += 1;
 			if !old_config.websites.contains(x) {
 				// website x has been added
-				spawn_watcher(new_config.global.clone(), x, tx_watchers.clone())?;
+				spawn_watcher(x, tx_watchers.clone()).await;
 			} else {
 				// website x has been deleted
 				x.enabled.store(false, Ordering::Release);
