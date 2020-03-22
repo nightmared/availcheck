@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::ops::DerefMut;
 
 use c_ares_resolver::FutureResolver;
 use async_trait::async_trait;
@@ -54,13 +55,6 @@ pub struct DnsResolverServer {
 	// TODO: one mutex per clientcan lead to some significant memory overhead
 	clients: Vec<Mutex<(Receiver<Name>, Sender<Option<IpAddr>>)>>
 }
-
-#[derive(Clone)]
-pub struct DnsResolverClient {
-	sender: std::sync::Arc<Sender<Name>>,
-	receiver: std::sync::Arc<Receiver<Option<IpAddr>>>
-}
-
 
 impl DnsResolverServer {
 	pub fn new(refresh_frequency: Duration) -> Self {
@@ -145,23 +139,21 @@ impl DnsResolverServer {
 }
 
 // a slightly modified version of the select_ok() method provided by futures_util
-pub struct SelectOk<'a, Fut> {
-	inner: HashMap<usize, Fut>,
-	_lft_a: std::marker::PhantomData<&'a ()>
+pub struct SelectOk<Fut> {
+	inner: HashMap<usize, Fut>
 }
 
-impl<'a, Fut: Unpin> Unpin for SelectOk<'a, Fut> {}
+impl<Fut: Unpin> Unpin for SelectOk<Fut> {}
 
-pub fn select_ok<'a, F>(v: HashMap<usize, F>) -> SelectOk<'a, F>
+pub fn select_ok<F>(v: HashMap<usize, F>) -> SelectOk<F>
 	where F: TryFuture + Unpin {
 
 	SelectOk {
-		inner: v,
-		_lft_a: std::marker::PhantomData
+		inner: v
 	}
 }
 
-impl<'a, Fut: TryFuture + Unpin> Future for SelectOk<'a, Fut> {
+impl<Fut: TryFuture + Unpin> Future for SelectOk<Fut> {
 	type Output = Result<(Fut::Ok, HashMap<usize, Fut>), Fut::Error>;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -197,6 +189,12 @@ impl<'a, Fut: TryFuture + Unpin> Future for SelectOk<'a, Fut> {
 	}
 }
 
+#[derive(Clone)]
+pub struct DnsResolverClient {
+	sender: Arc<std::sync::Mutex<Sender<Name>>>,
+	receiver: Arc<std::sync::Mutex<Receiver<Option<IpAddr>>>>
+}
+
 
 impl Service<Name> for DnsResolverClient {
 	type Response = std::iter::Once<IpAddr>;
@@ -209,14 +207,16 @@ impl Service<Name> for DnsResolverClient {
 
 	fn call(&mut self, name: Name) -> Self::Future {
 		// terrible hack due to the fact we cannot have a 'static lifetime here
-		// we totally assumes that the DnsResolverClient cannot disappear while the client is
+		// we totally assume that the DnsResolverClient cannot disappear while the client is
 		// operating
-		let mut send = unsafe { Arc::from_raw(Arc::into_raw(self.sender.clone())) };
-		let mut recv = unsafe { Arc::from_raw(Arc::into_raw(self.receiver.clone())) };
+		let (sender, receiver) = unsafe {
+			((self.sender.lock().unwrap().deref_mut() as *mut Sender<Name>).as_mut().unwrap(),
+			(self.receiver.lock().unwrap().deref_mut() as *mut Receiver<Option<IpAddr>>).as_mut().unwrap())
+		};
 
 		Box::pin(async move {
-			Arc::get_mut(&mut send).unwrap().send(name).await?;
-			let recv = Arc::get_mut(&mut recv).unwrap().recv();
+			let send = sender.send(name).await?;
+			let recv = receiver.recv();
 			match recv.await.unwrap_or(None).map(|x| std::iter::once(x)) {
 				Some(x) => Ok(x),
 				None => Err(Error::ResolutionFailed)
@@ -330,8 +330,8 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
 
 	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClient {
 		DnsResolverClient {
-			sender: Arc::new(sender),
-			receiver: Arc::new(receiver)
+			sender: Arc::new(std::sync::Mutex::new(sender)),
+			receiver: Arc::new(std::sync::Mutex::new(receiver))
 		}
 	}
 
@@ -347,7 +347,6 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
 
 impl Into<MetricResult> for Result<(hyper::Response<Body>, u64), Error> {
 	fn into(self: Result<(hyper::Response<Body>, u64), Error>) -> MetricResult {
-		println!("{:?}", self);
 		match self {
 			Ok(res) => MetricResult::Success(res.into()),
 			Err(e) => {
