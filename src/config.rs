@@ -67,7 +67,7 @@ pub async fn load_config() -> std::io::Result<Config> {
 			format!("Duplicate names in your config file: {:?}", duplicates)));
 	}
 
-	Ok(Config {
+	let new_config = Config {
 		websites: conf.websites
 			.into_iter()
 			.map(|mut x| {
@@ -76,7 +76,11 @@ pub async fn load_config() -> std::io::Result<Config> {
 				Arc::new(x)
 			}).collect(),
 		global: conf.global
-	})
+	};
+
+	tokio::spawn(dns_resolver.run());
+
+	Ok(new_config)
 }
 
 struct UrlVisitor;

@@ -1,10 +1,10 @@
 use std::time::{Instant, Duration};
 use std::task::{Context, Poll};
 use std::future::Future;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use c_ares_resolver::FutureResolver;
 use async_trait::async_trait;
@@ -13,10 +13,11 @@ use hyper::service::Service;
 use hyper::{Body, Request};
 use hyper::body::HttpBody;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use native_tls::TlsConnector;
 use hyper_tls::HttpsConnector;
-use crossbeam_channel::{Receiver, Sender};
+use futures_core::TryFuture;
+use futures::future::TryFutureExt;
 
 use crate::metrics::{MetricResult, MetricData};
 use crate::errors::Error;
@@ -48,52 +49,154 @@ pub struct DnsResolverInner {
 // DnsResolverServer), and restart resolving from scratch
 // TODO: stop old DnsResolverServer upon reloading
 pub struct DnsResolverServer {
-	hosts: HashMap<String, DnsResolverInner>,
+	hosts: Mutex<HashMap<String, DnsResolverInner>>,
 	refresh_frequency: Duration,
-	clients: Vec<(Receiver<Name>, mpsc::Sender<Option<IpAddr>>)>
+	// TODO: one mutex per clientcan lead to some significant memory overhead
+	clients: Vec<Mutex<(Receiver<Name>, Sender<Option<IpAddr>>)>>
 }
 
 #[derive(Clone)]
 pub struct DnsResolverClient {
-	sender: Sender<Name>,
-	receiver: std::sync::Arc<mpsc::Receiver<Option<IpAddr>>>
+	sender: std::sync::Arc<Sender<Name>>,
+	receiver: std::sync::Arc<Receiver<Option<IpAddr>>>
 }
 
 
 impl DnsResolverServer {
 	pub fn new(refresh_frequency: Duration) -> Self {
 		DnsResolverServer {
-			hosts: HashMap::new(),
+			hosts: Mutex::new(HashMap::new()),
 			refresh_frequency,
 			clients: Vec::new()
 		}
 	}
 
-	pub fn add_client(&mut self) -> (Sender<Name>, mpsc::Receiver<Option<IpAddr>>) {
-		let (tx_name, rx_name) = crossbeam_channel::unbounded();
-		let (tx_res, rx_res) = mpsc::channel(25);
-		self.clients.push((rx_name, tx_res));
+	pub fn add_client(&mut self) -> (Sender<Name>, Receiver<Option<IpAddr>>) {
+		let (tx_name, rx_name) = channel(25);
+		let (tx_res, rx_res) = channel(25);
+		self.clients.push(Mutex::new((rx_name, tx_res)));
 		(tx_name, rx_res)
 	}
 
-	async fn run(self) {
-		/*
-		// we cache the dns result so as to not spam our DNS resolver
-		println!("{:?}", resolve_host(name.as_str()).await);
-		if let Some(inner) = (*self).inner {
-			if inner.last_resolution_time.elapsed() < (*self).refresh_frequency {
-				return Ok(std::iter::once(inner.last_answer));
+	fn gen_waiter<'a>(&'a self, i: usize) -> impl Future<Output = Result<(Name, usize), ()>> + 'a + Send {
+		let client = self.clients[i].lock();
+		async move {
+			let mut client = client.await;
+			match client.0.recv().await {
+				Some(val) => Ok((val, i)),
+				None => Err(())
 			}
 		}
-		let last_answer = resolve_host(name.as_str()).await?;
-		(*self).inner = Some(DnsResolverInner {
-			last_answer,
-			last_resolution_time: Instant::now()
-		});
-		Ok(std::iter::once(last_answer))
-		*/
+	}
+
+	async fn resolve(&self, host: Name, i: usize) {
+		// we cache the dns result so as to not spam our DNS resolver
+		let mut hosts = self.hosts.lock().await;
+		if let Some(inner) = hosts.get(host.as_str().into()) {
+			if inner.last_resolution_time.elapsed() < self.refresh_frequency {
+				let mut client = self.clients.get(i).unwrap().lock().await;
+				client.1.send(Some(inner.last_answer)).await.unwrap();
+			}
+		}
+		match resolve_host(host.as_str()).await {
+			Ok(last_answer) => {
+				hosts.insert(host.as_str().to_string(), DnsResolverInner {
+					last_answer,
+					last_resolution_time: Instant::now()
+				});
+				let mut client = self.clients.get(i).unwrap().lock().await;
+				client.1.send(Some(last_answer)).await.unwrap();
+			}, Err(_) => {
+				let mut client = self.clients.get(i).unwrap().lock().await;
+				client.1.send(None).await.unwrap();
+			}
+		}
+	}
+
+	pub async fn run(self) {
+		if self.clients.len() == 0 {
+			eprintln!("The DnsResolver service was started with 0 clients, are you checking any service in your config file ?");
+			return;
+		}
+
+		// all thoses allocations probably have a big overhead but are only
+		// executed once per load
+		let mut v: HashMap<usize, Pin<Box<dyn Future<Output = Result<(Name, usize), ()>> + Send>>> = HashMap::with_capacity(self.clients.len());
+		for i in 0..self.clients.len() {
+			v.insert(i, Box::pin(self.gen_waiter(i)));
+		}
+
+		let mut awaiting_future = select_ok(v);
+
+		loop {
+			match awaiting_future.await {
+				Ok(((msg, idx), mut rest)) => {
+					// re-add a waiter for this element
+					rest.insert(idx, Box::pin(self.gen_waiter(idx)));
+					awaiting_future = select_ok(rest);
+
+					self.resolve(msg, idx).await;
+				}, Err(()) => {
+					return;
+				}
+			}
+		}
 	}
 }
+
+// a slightly modified version of the select_ok() method provided by futures_util
+pub struct SelectOk<'a, Fut> {
+	inner: HashMap<usize, Fut>,
+	_lft_a: std::marker::PhantomData<&'a ()>
+}
+
+impl<'a, Fut: Unpin> Unpin for SelectOk<'a, Fut> {}
+
+pub fn select_ok<'a, F>(v: HashMap<usize, F>) -> SelectOk<'a, F>
+	where F: TryFuture + Unpin {
+
+	SelectOk {
+		inner: v,
+		_lft_a: std::marker::PhantomData
+	}
+}
+
+impl<'a, Fut: TryFuture + Unpin> Future for SelectOk<'a, Fut> {
+	type Output = Result<(Fut::Ok, HashMap<usize, Fut>), Fut::Error>;
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		loop {
+			let item = self.inner.iter_mut().find_map(|(i, f)| {
+				match (*f).try_poll_unpin(cx) {
+					Poll::Pending => None,
+					Poll::Ready(e) => Some((i, e)),
+				}
+			});
+			match item {
+				Some((idx, res)) => {
+					let idx = *idx;
+					self.inner.remove(&idx);
+					match res {
+						Ok(e) => {
+							let inner = std::mem::replace(&mut self.inner, HashMap::new());
+							return Poll::Ready(Ok((e, inner)))
+						}
+						Err(e) => {
+							if self.inner.is_empty() {
+								return Poll::Ready(Err(e))
+							}
+						}
+					}
+				}
+				None => {
+					// based on the filter above, nothing is ready, return
+					return Poll::Pending
+				}
+			}
+		}
+	}
+}
+
 
 impl Service<Name> for DnsResolverClient {
 	type Response = std::iter::Once<IpAddr>;
@@ -102,12 +205,18 @@ impl Service<Name> for DnsResolverClient {
 
 	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		Poll::Ready(Ok(()))
-    }
+	}
 
 	fn call(&mut self, name: Name) -> Self::Future {
-		self.sender.send(name).unwrap();
-		let recv = self.receiver.clone().recv();
-		Box::pin(async {
+		// terrible hack due to the fact we cannot have a 'static lifetime here
+		// we totally assumes that the DnsResolverClient cannot disappear while the client is
+		// operating
+		let mut send = unsafe { Arc::from_raw(Arc::into_raw(self.sender.clone())) };
+		let mut recv = unsafe { Arc::from_raw(Arc::into_raw(self.receiver.clone())) };
+
+		Box::pin(async move {
+			Arc::get_mut(&mut send).unwrap().send(name).await?;
+			let recv = Arc::get_mut(&mut recv).unwrap().recv();
 			match recv.await.unwrap_or(None).map(|x| std::iter::once(x)) {
 				Some(x) => Ok(x),
 				None => Err(Error::ResolutionFailed)
@@ -121,14 +230,14 @@ pub trait UrlQueryMaker {
 	type R;
 	type E;
 	async fn internal_query(&self) -> Result<Self::R, Self::E>;
-	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: mpsc::Receiver<Option<IpAddr>>) -> DnsResolverClient;
+	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClient;
 	fn internal_gen_client(&mut self, resolver: DnsResolverClient);
 }
 
 #[async_trait]
 pub trait Url {
 	async fn query(&self) -> MetricResult;
-	fn gen_client(&mut self, sender: Sender<Name>, receiver: mpsc::Receiver<Option<IpAddr>>);
+	fn gen_client(&mut self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>);
 }
 
 #[async_trait]
@@ -149,7 +258,7 @@ impl<T> Url for HttpWrapper<T>
 		output.into().map_success(|x| x.response_time = Some(stop))
 	}
 
-	fn gen_client(&mut self,  sender: Sender<Name>, receiver: mpsc::Receiver<Option<IpAddr>>) {
+	fn gen_client(&mut self,  sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) {
 		self.internal_gen_client(self.internal_gen_resolver(sender, receiver));
 	}
 }
@@ -177,11 +286,10 @@ impl<T> HttpWrapper<T>
 	where HttpWrapper<T>: UrlQueryMaker + Url + PartialEq + Eq + std::hash::Hash {
 
 	pub fn new(v: T) -> Self {
-		let mut res = HttpWrapper {
+		HttpWrapper {
 			inner: v,
 			client: None
-		};
-		res
+		}
 	}
 }
 
@@ -196,8 +304,8 @@ async fn do_http_query(client: &mut Client<HttpsConnector<HttpConnector<DnsResol
 
 	let mut size = 0;
 	while let Some(next) = res.data().await {
-        size += next?.len();
-    }
+		size += next?.len();
+	}
 
 	Ok((res, size as u64))
 }
@@ -220,9 +328,9 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
 		}
 	}
 
-	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: mpsc::Receiver<Option<IpAddr>>) -> DnsResolverClient {
+	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClient {
 		DnsResolverClient {
-			sender,
+			sender: Arc::new(sender),
 			receiver: Arc::new(receiver)
 		}
 	}

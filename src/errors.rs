@@ -6,7 +6,8 @@ pub enum Error {
 	Timeout(tokio::time::Elapsed),
 	InvalidUri(http::uri::InvalidUri),
 	InvalidRequest(http::Error),
-	ResolutionFailed
+	ResolutionFailed,
+	ChannelFailure(tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>)
 }
 
 impl std::fmt::Display for Error {
@@ -23,7 +24,8 @@ impl std::error::Error for Error {
 			Error::Timeout(e) => Some(e),
 			Error::InvalidUri(e) => Some(e),
 			Error::InvalidRequest(e) => Some(e),
-			Error::ResolutionFailed => None
+			Error::ResolutionFailed => None,
+			Error::ChannelFailure(e) => Some(e)
 		}
     }
 }
@@ -59,7 +61,13 @@ impl From<http::Error> for Error {
 }
 
 impl From<c_ares::Error> for Error {
-	fn from(val: c_ares::Error) -> Self {
+	fn from(_val: c_ares::Error) -> Self {
 		Error::ResolutionFailed
+	}
+}
+
+impl From<tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>> for Error {
+	fn from(val: tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>) -> Self {
+		Error::ChannelFailure(val)
 	}
 }
