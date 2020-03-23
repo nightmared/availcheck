@@ -11,7 +11,8 @@ use serde::{Deserialize, Deserializer};
 use serde::de;
 use tokio::fs;
 
-use crate::query_providers::{Url, HttpStruct, HttpWrapper, DnsResolverServer};
+use crate::query_providers::{Url, HttpStruct, HttpWrapper};
+use crate::dns::DnsResolverServer;
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")

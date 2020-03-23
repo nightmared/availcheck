@@ -13,6 +13,7 @@ use warp::Filter;
 
 
 mod config;
+mod dns;
 mod errors;
 mod metrics;
 mod query_providers;
