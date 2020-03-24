@@ -4,7 +4,6 @@ use std::future::Future;
 use std::task::{Context, Poll};
 use std::sync::Arc;
 use std::net::IpAddr;
-use std::ops::DerefMut;
 use std::pin::Pin;
 
 use hyper::client::connect::dns::Name;
@@ -188,8 +187,8 @@ impl DnsResolverServer {
 
 #[derive(Clone)]
 pub struct DnsResolverClient {
-	sender: Arc<std::sync::Mutex<Sender<Name>>>,
-	receiver: Arc<std::sync::Mutex<Receiver<Option<IpAddr>>>>
+	sender: Arc<Sender<Name>>,
+	receiver: Arc<Receiver<Option<IpAddr>>>
 }
 
 
@@ -207,8 +206,8 @@ impl Service<Name> for DnsResolverClient {
 		// we totally assume that the DnsResolverClient cannot disappear while the client is
 		// operating
 		let (sender, receiver) = unsafe {
-			((self.sender.lock().unwrap().deref_mut() as *mut Sender<Name>).as_mut().unwrap(),
-			(self.receiver.lock().unwrap().deref_mut() as *mut Receiver<Option<IpAddr>>).as_mut().unwrap())
+			((Arc::get_mut_unchecked(&mut self.sender) as *mut Sender<Name>).as_mut().unwrap(),
+			(Arc::get_mut_unchecked(&mut self.receiver) as *mut Receiver<Option<IpAddr>>).as_mut().unwrap())
 		};
 
 		Box::pin(async move {
@@ -225,8 +224,8 @@ impl Service<Name> for DnsResolverClient {
 impl DnsResolverClient {
 	pub fn new(sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> Self {
 		DnsResolverClient {
-			sender: Arc::new(std::sync::Mutex::new(sender)),
-			receiver: Arc::new(std::sync::Mutex::new(receiver))
+			sender: Arc::new(sender),
+			receiver: Arc::new(receiver)
 		}
 	}
 }

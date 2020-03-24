@@ -1,3 +1,5 @@
+#![feature(get_mut_unchecked)]
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::net::{SocketAddr, IpAddr};
@@ -263,9 +265,10 @@ async fn main() -> std::io::Result<()> {
 			recv(rx_watchers) -> msg => match msg {
 				Ok(msg) => {
 					let mut state_wrt = state.write().unwrap();
-					// This website was deleted at runtime, let's remove it
 					match msg.msg {
-						WebsiteMessageType::Exit  => state_wrt.delete_website(&msg.website),
+						// This website was deleted at runtime, let's remove it
+						WebsiteMessageType::Exit => state_wrt.delete_website(&msg.website),
+						// A new metric was sent for this website, let's update it
 						WebsiteMessageType::MetricResult(e) => state_wrt.update_metrics(&msg.website, e)
 					}
 				},
