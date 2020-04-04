@@ -19,6 +19,7 @@ mod dns;
 mod errors;
 mod metrics;
 mod query_providers;
+mod task;
 use config::{Config, Website, load_config};
 use metrics::{WatcherMessage, WebServMessage, WebsiteMessageType, MetricResult};
 

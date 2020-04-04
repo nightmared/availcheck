@@ -1,72 +1,16 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::future::Future;
-use std::task::{Context, Poll};
-use std::sync::Arc;
 use std::net::IpAddr;
 use std::pin::Pin;
 
 use hyper::client::connect::dns::Name;
-use hyper::service::Service;
 use tokio::sync::mpsc::{channel, Sender, Receiver};
 use tokio::sync::Mutex;
 use c_ares_resolver::FutureResolver;
-use futures::future::TryFuture;
-use futures::future::TryFutureExt;
 
 use crate::errors::Error;
-
-// a slightly modified version of the select_ok() method provided by futures_util
-pub struct SelectOk<Fut> {
-	inner: HashMap<usize, Fut>
-}
-
-impl<Fut: Unpin> Unpin for SelectOk<Fut> {}
-
-pub fn select_ok<F>(v: HashMap<usize, F>) -> SelectOk<F>
-	where F: TryFuture + Unpin {
-
-	SelectOk {
-		inner: v
-	}
-}
-
-impl<Fut: TryFuture + Unpin> Future for SelectOk<Fut> {
-	type Output = Result<(Fut::Ok, HashMap<usize, Fut>), Fut::Error>;
-
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		loop {
-			let item = self.inner.iter_mut().find_map(|(i, f)| {
-				match (*f).try_poll_unpin(cx) {
-					Poll::Pending => None,
-					Poll::Ready(e) => Some((i, e)),
-				}
-			});
-			match item {
-				Some((idx, res)) => {
-					let idx = *idx;
-					self.inner.remove(&idx);
-					match res {
-						Ok(e) => {
-							let inner = std::mem::replace(&mut self.inner, HashMap::new());
-							return Poll::Ready(Ok((e, inner)))
-						}
-						Err(e) => {
-							if self.inner.is_empty() {
-								return Poll::Ready(Err(e))
-							}
-						}
-					}
-				}
-				None => {
-					// based on the filter above, nothing is ready, return
-					return Poll::Pending
-				}
-			}
-		}
-	}
-}
-
+use crate::task::{TaskClient, TaskClientService, select_ok};
 
 async fn resolve_host(host: &str) -> Result<IpAddr, Error> {
 	match host.parse() {
@@ -185,47 +129,5 @@ impl DnsResolverServer {
 }
 
 
-#[derive(Clone)]
-pub struct DnsResolverClient {
-	sender: Arc<Sender<Name>>,
-	receiver: Arc<Receiver<Option<IpAddr>>>
-}
-
-
-impl Service<Name> for DnsResolverClient {
-	type Response = std::iter::Once<IpAddr>;
-	type Error = Error;
-	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-		Poll::Ready(Ok(()))
-	}
-
-	fn call(&mut self, name: Name) -> Self::Future {
-		// terrible hack due to the fact we cannot have a 'static lifetime here
-		// we totally assume that the DnsResolverClient cannot disappear while the client is
-		// operating
-		let (sender, receiver) = unsafe {
-			((Arc::get_mut_unchecked(&mut self.sender) as *mut Sender<Name>).as_mut().unwrap(),
-			(Arc::get_mut_unchecked(&mut self.receiver) as *mut Receiver<Option<IpAddr>>).as_mut().unwrap())
-		};
-
-		Box::pin(async move {
-			sender.send(name).await?;
-			let recv = receiver.recv();
-			match recv.await.unwrap_or(None).map(|x| std::iter::once(x)) {
-				Some(x) => Ok(x),
-				None => Err(Error::ResolutionFailed)
-			}
-		})
-	}
-}
-
-impl DnsResolverClient {
-	pub fn new(sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> Self {
-		DnsResolverClient {
-			sender: Arc::new(sender),
-			receiver: Arc::new(receiver)
-		}
-	}
-}
+pub type DnsResolverClient = TaskClient<Name, Option<IpAddr>, Error>;
+pub type DnsResolverClientService = TaskClientService<Name, Option<IpAddr>, std::iter::Once<IpAddr>, Error>;

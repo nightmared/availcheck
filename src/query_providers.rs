@@ -12,17 +12,15 @@ use hyper_tls::HttpsConnector;
 
 use crate::metrics::{MetricResult, MetricData};
 use crate::errors::Error;
-
-
-use crate::dns::DnsResolverClient;
+use crate::dns::{DnsResolverClient, DnsResolverClientService};
 
 #[async_trait]
 pub trait UrlQueryMaker {
 	type R;
 	type E;
 	async fn internal_query(&self) -> Result<Self::R, Self::E>;
-	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClient;
-	fn internal_gen_client(&mut self, resolver: DnsResolverClient);
+	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClientService;
+	fn internal_gen_client(&mut self, resolver: DnsResolverClientService);
 }
 
 #[async_trait]
@@ -49,14 +47,14 @@ impl<T> Url for HttpWrapper<T>
 		output.into().map_success(|x| x.response_time = Some(stop))
 	}
 
-	fn gen_client(&mut self,  sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) {
+	fn gen_client(&mut self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) {
 		self.internal_gen_client(self.internal_gen_resolver(sender, receiver));
 	}
 }
 
 pub struct HttpWrapper<T> {
 	inner: T,
-	client: Option<Mutex<Client<HttpsConnector<HttpConnector<DnsResolverClient>>, Body>>>
+	client: Option<Mutex<Client<HttpsConnector<HttpConnector<DnsResolverClientService>>, Body>>>
 }
 
 impl<T: std::cmp::Eq + std::hash::Hash> std::hash::Hash for HttpWrapper<T> {
@@ -90,7 +88,7 @@ pub struct HttpStruct {
 	pub query: String
 }
 
-async fn do_http_query(client: &mut Client<HttpsConnector<HttpConnector<DnsResolverClient>>>, req: Request<Body>) -> Result<(hyper::Response<Body>, u64), Error> {
+async fn do_http_query(client: &mut Client<HttpsConnector<HttpConnector<DnsResolverClientService>>>, req: Request<Body>) -> Result<(hyper::Response<Body>, u64), Error> {
 	let mut res = client.request(req).await?;
 
 	let mut size = 0;
@@ -120,11 +118,15 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
 		}
 	}
 
-	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClient {
-		DnsResolverClient::new(sender, receiver)
+	fn internal_gen_resolver(&self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) -> DnsResolverClientService {
+		DnsResolverClientService::new(DnsResolverClient::new(sender, receiver),
+			&|x| match x.unwrap_or(None).map(|x| std::iter::once(x)) {
+				Some(x) => Ok(x),
+				None => Err(Error::ResolutionFailed)
+			})
 	}
 
-	fn internal_gen_client(&mut self, resolver: DnsResolverClient) {
+	fn internal_gen_client(&mut self, resolver: DnsResolverClientService) {
 		let tls_connector = TlsConnector::new().unwrap();
 		let mut http_connector = HttpConnector::new_with_resolver(resolver);
 		http_connector.enforce_http(false);
