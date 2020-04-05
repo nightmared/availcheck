@@ -1,7 +1,4 @@
 use std::time::Duration;
-use std::sync::Arc;
-
-use crate::config::Website;
 
 #[derive(Debug, PartialEq)]
 pub struct MetricData {
@@ -26,18 +23,6 @@ impl MetricResult {
 		}
 		self
 	}
-}
-
-#[derive(Debug, PartialEq)]
-pub enum WebsiteMessageType {
-	MetricResult(MetricResult),
-	Exit
-}
-
-#[derive(PartialEq)]
-pub struct WatcherMessage {
-	pub website: Arc<Website>,
-	pub msg: WebsiteMessageType
 }
 
 #[derive(Debug, PartialEq)]

@@ -24,14 +24,15 @@ pub trait UrlQueryMaker {
 }
 
 #[async_trait]
-pub trait Url {
+pub trait Url: std::fmt::Debug {
 	async fn query(&self) -> MetricResult;
 	fn gen_client(&mut self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>);
 }
 
 #[async_trait]
 impl<T> Url for HttpWrapper<T>
-	where Self: UrlQueryMaker + Send + Sync,
+	where T: std::fmt::Debug,
+	Self: UrlQueryMaker + Send + Sync,
 	Result<<Self as UrlQueryMaker>::R, <Self as UrlQueryMaker>::E>: Into<MetricResult> {
 
 	async fn query(&self) -> MetricResult {
@@ -52,6 +53,7 @@ impl<T> Url for HttpWrapper<T>
 	}
 }
 
+#[derive(Debug)]
 pub struct HttpWrapper<T> {
 	inner: T,
 	client: Option<Mutex<Client<HttpsConnector<HttpConnector<DnsResolverClientService>>, Body>>>

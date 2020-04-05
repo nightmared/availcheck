@@ -1,6 +1,5 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr};
@@ -126,15 +125,13 @@ impl<'de> Deserialize<'de> for Box<dyn Url + Send + Sync> {
 }
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Website {
 	// TODO: sanitize this field
 	pub name: String,
 	pub url: Box<dyn Url + Send + Sync>,
 	#[serde(default="default_checktime")]
-	pub check_time_seconds: u64,
-	#[serde(skip_deserializing, default = "default_enabled")]
-	pub enabled: AtomicBool
+	pub check_time_seconds: u64
 }
 
 
@@ -209,8 +206,4 @@ fn default_dns_refresh_time() -> u64 {
 
 fn default_addr() -> IpAddr {
 	IpAddr::from(Ipv4Addr::new(0, 0, 0, 0))
-}
-
-fn default_enabled() -> AtomicBool {
-	AtomicBool::new(true)
 }
