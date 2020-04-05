@@ -12,7 +12,7 @@ use serde::de;
 use tokio::fs;
 
 use crate::query_providers::{Url, HttpStruct, HttpWrapper};
-use crate::dns::DnsResolverServer;
+use crate::dns::{DnsResolverServer, DnsResolverServerState};
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -55,7 +55,11 @@ fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
 pub async fn load_config() -> std::io::Result<Config> {
 	let conf: SerializedConfig = load_app_data("config.yml").await?;
 
-	let mut dns_resolver = DnsResolverServer::new(Duration::new(conf.global.dns_refresh_time_seconds, 0));
+	let mut dns_resolver = DnsResolverServer::new(
+		DnsResolverServerState::new(
+			Duration::new(conf.global.dns_refresh_time_seconds, 0)
+		)
+	);
 
 	let mut names = conf.websites
 		.iter()
@@ -72,7 +76,7 @@ pub async fn load_config() -> std::io::Result<Config> {
 		websites: conf.websites
 			.into_iter()
 			.map(|mut x| {
-				let (tx, rx) = dns_resolver.add_client();
+				let (tx, rx) = dns_resolver.gen_client();
 				x.url.gen_client(tx, rx);
 				Arc::new(x)
 			}).collect(),

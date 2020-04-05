@@ -3,8 +3,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::future::Future;
 use std::pin::Pin;
+use std::marker::PhantomData;
 
+use async_trait::async_trait;
 use tokio::sync::mpsc::{channel, Sender, Receiver};
+use tokio::sync::Mutex;
 use hyper::service::Service;
 use futures::future::TryFuture;
 use futures::future::TryFutureExt;
@@ -60,11 +63,85 @@ impl<Fut: TryFuture + Unpin> Future for SelectOk<Fut> {
 	}
 }
 
+pub struct TaskServer<Q, A, S> {
+	state: S,
+	// TODO: one mutex per client can lead to some significant memory overhead
+	clients: Vec<Mutex<(Receiver<Q>, Sender<A>)>>
+}
 
+#[async_trait]
+pub trait TaskServerOperation<Q, A> {
+	async fn op(&self, query: Q) -> Option<A>;
+}
+
+impl<Q, A, S> TaskServer<Q, A, S>
+	where S: TaskServerOperation<Q, A>,
+	Q: Send + 'static,
+	A: std::fmt::Debug + Send + 'static {
+
+	pub fn new(state: S) -> Self {
+		TaskServer {
+			state,
+			clients: Vec::new()
+		}
+	}
+
+	pub fn gen_client(&mut self) -> (Sender<Q>, Receiver<A>) {
+		let (tx_name, rx_name) = channel(25);
+		let (tx_res, rx_res) = channel(25);
+		self.clients.push(Mutex::new((rx_name, tx_res)));
+		(tx_name, rx_res)
+	}
+
+	fn gen_waiter<'a>(&'a self, i: usize) -> impl Future<Output = Result<(Q, usize), ()>> + 'a + Send {
+		let client = self.clients[i].lock();
+		async move {
+			let mut client = client.await;
+			match client.0.recv().await {
+				Some(val) => Ok((val, i)),
+				None => Err(())
+			}
+		}
+	}
+
+	pub async fn run(self) {
+		if self.clients.len() == 0 {
+			eprintln!("The DnsResolver service was started with 0 clients, are you checking any service in your config file ?");
+			return;
+		}
+
+		// all thoses allocations probably have a big overhead but are only
+		// executed once per load
+		let mut v: HashMap<usize, Pin<Box<dyn Future<Output = Result<(Q, usize), ()>> + Send>>> = HashMap::with_capacity(self.clients.len());
+		for i in 0..self.clients.len() {
+			v.insert(i, Box::pin(self.gen_waiter(i)));
+		}
+
+		let mut awaiting_future = select_ok(v);
+
+		loop {
+			match awaiting_future.await {
+				Ok(((msg, idx), mut rest)) => {
+					// re-add a waiter for this element
+					rest.insert(idx, Box::pin(self.gen_waiter(idx)));
+					awaiting_future = select_ok(rest);
+
+					if let Some(res) = self.state.op(msg).await {
+						let mut client = self.clients.get(idx).unwrap().lock().await;
+						client.1.send(res).await.unwrap();
+					}
+				}, Err(()) => {
+					// return when all channels are closed
+					return;
+				}
+			}
+		}
+	}
+}
 pub struct TaskClient<Q, A, E> {
 	sender: Arc<Sender<Q>>,
 	receiver: Arc<Receiver<A>>,
-	_error: std::marker::PhantomData<E>
+	_error: PhantomData<E>
 }
 
 impl<Q, A, E> Clone for TaskClient<Q, A, E> {
@@ -72,7 +149,7 @@ impl<Q, A, E> Clone for TaskClient<Q, A, E> {
 		TaskClient {
 			sender: self.sender.clone(),
 			receiver: self.receiver.clone(),
-			_error: std::marker::PhantomData
+			_error: PhantomData
 		}
 	}
 }
@@ -82,7 +159,7 @@ impl<Q, A, E> TaskClient<Q, A, E> {
 		TaskClient {
 			sender: Arc::new(sender),
 			receiver: Arc::new(receiver),
-			_error: std::marker::PhantomData
+			_error: PhantomData
 		}
 	}
 }
