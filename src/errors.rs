@@ -1,13 +1,13 @@
 
 #[derive(Debug)]
 pub enum Error {
-	Hyper(hyper::Error),
+	Curl(curl::Error),
 	Serde(serde_yaml::Error),
 	Timeout(tokio::time::Elapsed),
 	InvalidUri(http::uri::InvalidUri),
 	InvalidRequest(http::Error),
-	ResolutionFailed,
-	ChannelFailure(tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>)
+	LooperCrashed,
+	DnsResolutionFailed
 }
 
 impl std::fmt::Display for Error {
@@ -19,20 +19,20 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
 		match self {
-			Error::Hyper(e) => Some(e),
+			Error::Curl(e) => Some(e),
 			Error::Serde(e) => Some(e),
 			Error::Timeout(e) => Some(e),
 			Error::InvalidUri(e) => Some(e),
 			Error::InvalidRequest(e) => Some(e),
-			Error::ResolutionFailed => None,
-			Error::ChannelFailure(e) => Some(e)
+			Error::LooperCrashed => None,
+			Error::DnsResolutionFailed => None
 		}
     }
 }
 
-impl From<hyper::Error> for Error {
-	fn from(val: hyper::Error) -> Self {
-		Error::Hyper(val)
+impl From<curl::Error> for Error {
+	fn from(val: curl::Error) -> Self {
+		Error::Curl(val)
 	}
 }
 
@@ -62,12 +62,6 @@ impl From<http::Error> for Error {
 
 impl From<c_ares::Error> for Error {
 	fn from(_val: c_ares::Error) -> Self {
-		Error::ResolutionFailed
-	}
-}
-
-impl From<tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>> for Error {
-	fn from(val: tokio::sync::mpsc::error::SendError<hyper::client::connect::dns::Name>) -> Self {
-		Error::ChannelFailure(val)
+		Error::DnsResolutionFailed
 	}
 }

@@ -2,27 +2,23 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use std::net::IpAddr;
 
-use async_trait::async_trait;
-use hyper::client::connect::dns::Name;
-use tokio::sync::Mutex;
-use c_ares_resolver::FutureResolver;
+use c_ares_resolver::BlockingResolver;
 
 use crate::errors::Error;
-use crate::task::{TaskClient, TaskClientService, TaskServer, TaskServerOperation};
 
-async fn resolve_host(host: &str) -> Result<IpAddr, Error> {
+fn resolve_host(host: &str) -> Result<IpAddr, Error> {
 	match host.parse() {
 		Ok(x) => Ok(x),
 		Err(_) =>
 			// TODO: ipv6
-			match FutureResolver::new() {
+			match BlockingResolver::new() {
 				Ok(resolver) => {
-					for i in &resolver.query_a(host).await? {
+					for i in &resolver.query_a(host)? {
 						return Ok(i.ipv4().into());
 					}
-					Err(Error::ResolutionFailed)
+					Err(Error::DnsResolutionFailed)
 				}
-				Err(_) => Err(Error::ResolutionFailed)
+				Err(_) => Err(Error::DnsResolutionFailed)
 			}
 	}
 }
@@ -33,10 +29,17 @@ pub struct DnsResolverServerInner {
 	last_answer: IpAddr
 }
 
+impl DnsResolverServerInner {
+	fn run(mut self) {
+
+	}
+
+}
+
 // garbage collection of hosts is ensured at reloading (reloading generates a new
 // DnsResolverServer), and restart resolving from scratch
 pub struct DnsResolverServerState {
-	hosts: Mutex<HashMap<String, DnsResolverServerInner>>,
+	hosts: HashMap<String, DnsResolverServerInner>,
 	refresh_frequency: Duration,
 
 }
@@ -44,19 +47,17 @@ pub struct DnsResolverServerState {
 impl DnsResolverServerState {
 	pub fn new(refresh_frequency: Duration) -> Self {
 		DnsResolverServerState {
-			hosts: Mutex::new(HashMap::new()),
+			hosts: HashMap::new(),
 			refresh_frequency
 		}
 	}
 }
-
-#[async_trait]
-impl TaskServerOperation<Name, Option<IpAddr>> for DnsResolverServerState {
-	async fn op(&self, query: Name) -> Option<Option<IpAddr>> {
+/*
+impl TaskServerOperation<String, Option<IpAddr>> for DnsResolverServerState {
+	fn op(&mut self, query: String) -> Option<Option<IpAddr>> {
 		// we cache the dns result so as to not spam our DNS resolver
-		let mut hosts = self.hosts.lock().await;
 		let hostname = query.as_str().to_string();
-		if let Some(inner) = hosts.get(&hostname) {
+		if let Some(inner) = self.hosts.get(&hostname) {
 			if inner.last_resolution_time.elapsed() < self.refresh_frequency {
 				return Some(Some(inner.last_answer));
 			}
@@ -75,7 +76,6 @@ impl TaskServerOperation<Name, Option<IpAddr>> for DnsResolverServerState {
 	}
 }
 
-
-pub type DnsResolverServer = TaskServer<Name, Option<IpAddr>, DnsResolverServerState>;
-pub type DnsResolverClient = TaskClient<Name, Option<IpAddr>, Error>;
-pub type DnsResolverClientService = TaskClientService<Name, Option<IpAddr>, std::iter::Once<IpAddr>, Error>;
+pub type DnsResolverServer = TaskServer<String, Option<IpAddr>, DnsResolverServerState>;
+pub type DnsResolverClient = TaskClient<String, Option<IpAddr>, Error>;
+*/

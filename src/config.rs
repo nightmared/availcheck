@@ -1,17 +1,17 @@
 use std::io;
+use std::fs;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr};
-use std::env;
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer};
 use serde::de;
-use tokio::fs;
 
-use crate::query_providers::{Url, HttpStruct, HttpWrapper};
-use crate::dns::{DnsResolverServer, DnsResolverServerState};
+use crate::query_providers::{Url, HttpRequest, Client};
+//use crate::dns::{DnsResolverServer, DnsResolverServerState};
 
 fn get_base_dir() -> PathBuf {
 	let config_base_dir = env::var_os("XDG_CONFIG_HOME")
@@ -22,21 +22,21 @@ fn get_base_dir() -> PathBuf {
 	Path::new(&config_base_dir).join("availcheck/")
 }
 
-async fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-	let file_content = fs::read_to_string(file_name).await?;
+fn load_yaml_file<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+	let file_content = fs::read_to_string(file_name)?;
 	serde_yaml::from_str::<T>(&file_content).map_err(|e| {
 		eprintln!("Unable to parse the file '{}': {:?}", file_name, e);
 		io::Error::from(io::ErrorKind::InvalidData)
 	})
 }
 
-async fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
+fn load_app_data<T: for <'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
 	let mut config_file_path = get_base_dir();
 	config_file_path.push(file_name);
 	// if your filename is not a valid utf-8 name, it's YOUR problem (like using a weird path
 	// and/or doing weird things).
 	// TODO: look into OsStr
-	load_yaml_file(&config_file_path.to_string_lossy()).await
+	load_yaml_file(&config_file_path.to_string_lossy())
 }
 
 // This function only works if you give it a sorted list
@@ -51,9 +51,11 @@ fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
 }
 
 
-pub async fn load_config() -> std::io::Result<Config> {
-	let conf: SerializedConfig = load_app_data("config.yml").await?;
+pub fn load_config() -> std::io::Result<Config> {
+	let conf: SerializedConfig = load_app_data("config.yml")?;
 
+	unimplemented!()
+	/*
 	let mut dns_resolver = DnsResolverServer::new(
 		DnsResolverServerState::new(
 			Duration::new(conf.global.dns_refresh_time_seconds, 0)
@@ -85,6 +87,7 @@ pub async fn load_config() -> std::io::Result<Config> {
 	tokio::spawn(dns_resolver.run());
 
 	Ok(new_config)
+	*/
 }
 
 struct UrlVisitor;
@@ -104,11 +107,25 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
 		if scheme_and_remainder.len() != 2 {
 			return Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self));
 		}
+		let host_and_path: Vec<&str> = scheme_and_remainder[1].splitn(2, '/').collect();
+		let path = host_and_path
+			.get(1)
+			.and_then(|&x| Some(x.into()))
+			.unwrap_or(String::new());
+		let host_and_port: Vec<&str> = host_and_path[0].splitn(2, ':').collect();
 
 		match scheme_and_remainder[0] {
 			"http" | "https" =>
-				Ok(Box::new(HttpWrapper::new(HttpStruct {
-					query: value.into()
+				Ok(Box::new(Client::new(HttpRequest {
+					query: value.into(),
+					tls_enabled: scheme_and_remainder[0] == "https",
+					port: host_and_port
+							.get(1)
+							.and_then(|x| str::parse::<u16>(x).ok())
+							.unwrap_or_else(|| if scheme_and_remainder[0] == "https" { 443 } else { 80 })
+					,
+					host: host_and_port[0].into(),
+					path
 				}))),
 			_ => Err(de::Error::invalid_value(serde::de::Unexpected::Str(value), &self))
 		}
@@ -206,4 +223,10 @@ fn default_dns_refresh_time() -> u64 {
 
 fn default_addr() -> IpAddr {
 	IpAddr::from(Ipv4Addr::new(0, 0, 0, 0))
+}
+ 
+
+#[derive(Debug, PartialEq)]
+pub enum WebServMessage {
+	ReloadConfig
 }
