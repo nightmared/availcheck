@@ -1,94 +1,23 @@
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hyper::body::HttpBody;
-use hyper::client::{connect::dns::Name, Client, HttpConnector};
-use hyper::{Body, Request};
-use hyper_tls::HttpsConnector;
-use native_tls::TlsConnector;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::Mutex;
+use hyper::client::HttpConnector;
+use hyper::{Body, Client, Request};
+use hyper_rustls::HttpsConnector;
 
-use crate::dns::{DnsResolverClient, DnsResolverClientService};
-use crate::errors::Error;
+use crate::dns::DnsService;
 use crate::metrics::{MetricData, MetricResult};
 
 #[async_trait]
 pub trait UrlQueryMaker {
     type R;
-    type E;
-    async fn internal_query(&self) -> Result<Self::R, Self::E>;
-    fn internal_gen_resolver(
-        &self,
-        sender: Sender<Name>,
-        receiver: Receiver<Option<IpAddr>>,
-    ) -> DnsResolverClientService;
-    fn internal_gen_client(&mut self, resolver: DnsResolverClientService);
+    async fn _query(&self, resolver: DnsService) -> anyhow::Result<Self::R>;
 }
 
 #[async_trait]
 pub trait Url: std::fmt::Debug {
-    async fn query(&self) -> MetricResult;
-    fn gen_client(&mut self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>);
-}
-
-#[async_trait]
-impl<T> Url for HttpWrapper<T>
-where
-    T: std::fmt::Debug,
-    Self: UrlQueryMaker + Send + Sync,
-    Result<<Self as UrlQueryMaker>::R, <Self as UrlQueryMaker>::E>: Into<MetricResult>,
-{
-    async fn query(&self) -> MetricResult {
-        // this is far from ideal (we could be preempted after getting an answer and before reading
-        // the time) but atohttpc (and the likes) doesn't expose timing information so we have to restrict ourselves
-        // to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
-        let start = Instant::now();
-
-        let output: Result<<Self as UrlQueryMaker>::R, <Self as UrlQueryMaker>::E> =
-            self.internal_query().await;
-
-        let stop = start.elapsed();
-
-        output.into().map_success(|x| x.response_time = Some(stop))
-    }
-
-    fn gen_client(&mut self, sender: Sender<Name>, receiver: Receiver<Option<IpAddr>>) {
-        self.internal_gen_client(self.internal_gen_resolver(sender, receiver));
-    }
-}
-
-#[derive(Debug)]
-pub struct HttpWrapper<T> {
-    inner: T,
-    client: Option<Mutex<Client<HttpsConnector<HttpConnector<DnsResolverClientService>>, Body>>>,
-}
-
-impl<T: std::cmp::Eq + std::hash::Hash> std::hash::Hash for HttpWrapper<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.inner.hash(state);
-    }
-}
-
-impl<T: std::cmp::Eq> PartialEq for HttpWrapper<T> {
-    fn eq(&self, other: &HttpWrapper<T>) -> bool {
-        self.inner == other.inner
-    }
-}
-
-impl<T: std::cmp::Eq> std::cmp::Eq for HttpWrapper<T> {}
-
-impl<T> HttpWrapper<T>
-where
-    HttpWrapper<T>: UrlQueryMaker + Url + PartialEq + Eq + std::hash::Hash,
-{
-    pub fn new(v: T) -> Self {
-        HttpWrapper {
-            inner: v,
-            client: None,
-        }
-    }
+    async fn query(&self, resolver: DnsService) -> MetricResult;
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -96,10 +25,30 @@ pub struct HttpStruct {
     pub query: String,
 }
 
+#[async_trait]
+impl Url for HttpStruct
+where
+    Self: UrlQueryMaker + Send + Sync,
+    anyhow::Result<<Self as UrlQueryMaker>::R>: Into<MetricResult>,
+{
+    async fn query(&self, resolver: DnsService) -> MetricResult {
+        // this is far from ideal (we could be preempted after getting an answer and before reading
+        // the time) but atohttpc (and the likes) doesn't expose timing information so we have to restrict ourselves
+        // to a "simple" monotonic clock. But hey, at least we aren't using gettimeofday() ;)
+        let start = Instant::now();
+
+        let output = self._query(resolver).await;
+
+        let stop = start.elapsed();
+
+        MetricResult::from(output).map_success(|x| x.response_time = Some(stop))
+    }
+}
+
 async fn do_http_query(
-    client: &mut Client<HttpsConnector<HttpConnector<DnsResolverClientService>>>,
+    client: &mut Client<HttpsConnector<HttpConnector<DnsService>>>,
     req: Request<Body>,
-) -> Result<(hyper::Response<Body>, u64), Error> {
+) -> anyhow::Result<(hyper::Response<Body>, u64)> {
     let mut res = client.request(req).await?;
 
     let mut size = 0;
@@ -111,15 +60,18 @@ async fn do_http_query(
 }
 
 #[async_trait]
-impl UrlQueryMaker for HttpWrapper<HttpStruct> {
+impl UrlQueryMaker for HttpStruct {
     type R = (hyper::Response<Body>, u64);
-    type E = Error;
 
-    async fn internal_query(&self) -> Result<Self::R, Self::E> {
-        let req = Request::get(&self.inner.query.parse::<http::Uri>()?)
+    async fn _query(&self, resolver: DnsService) -> anyhow::Result<Self::R> {
+        let mut http_connector = HttpConnector::new_with_resolver(resolver);
+        http_connector.enforce_http(false);
+        let https_connector = HttpsConnector::from((http_connector, rustls::ClientConfig::new()));
+        let mut client: Client<HttpsConnector<HttpConnector<DnsService>>> =
+            Client::builder().build(https_connector);
+        let req = Request::get(&self.query.parse::<http::Uri>()?)
             .header("User-Agent", "monitoring/availcheck")
             .body(Body::empty())?;
-        let mut client = self.client.as_ref().unwrap().lock().await;
         let timeout = tokio::time::timeout(Duration::new(7, 0), do_http_query(&mut client, req));
         let res = timeout.await;
         match res {
@@ -128,36 +80,14 @@ impl UrlQueryMaker for HttpWrapper<HttpStruct> {
             Err(e) => Err(e.into()),
         }
     }
-
-    fn internal_gen_resolver(
-        &self,
-        sender: Sender<Name>,
-        receiver: Receiver<Option<IpAddr>>,
-    ) -> DnsResolverClientService {
-        DnsResolverClientService::new(DnsResolverClient::new(sender, receiver), &|x| match x
-            .unwrap_or(None)
-            .map(|x| std::iter::once(x))
-        {
-            Some(x) => Ok(x),
-            None => Err(Error::ResolutionFailed),
-        })
-    }
-
-    fn internal_gen_client(&mut self, resolver: DnsResolverClientService) {
-        let tls_connector = TlsConnector::new().unwrap();
-        let mut http_connector = HttpConnector::new_with_resolver(resolver);
-        http_connector.enforce_http(false);
-        let https_connector = HttpsConnector::from((http_connector, tls_connector.into()));
-        self.client = Some(Mutex::new(hyper::Client::builder().build(https_connector)));
-    }
 }
 
-impl Into<MetricResult> for Result<(hyper::Response<Body>, u64), Error> {
-    fn into(self: Result<(hyper::Response<Body>, u64), Error>) -> MetricResult {
-        match self {
+impl From<anyhow::Result<(hyper::Response<Body>, u64)>> for MetricResult {
+    fn from(val: anyhow::Result<(hyper::Response<Body>, u64)>) -> MetricResult {
+        match val {
             Ok(res) => MetricResult::Success(res.into()),
             Err(e) => {
-                if let Error::Timeout(_) = e {
+                if e.downcast::<crate::errors::Timeout>().is_ok() {
                     MetricResult::Timeout
                 } else {
                     MetricResult::Error

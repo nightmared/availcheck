@@ -1,6 +1,3 @@
-#![feature(get_mut_unchecked)]
-
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -10,9 +7,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::time::delay_for;
-
-use warp::Filter;
+use tokio::time::sleep;
 
 mod config;
 mod dns;
@@ -20,9 +15,14 @@ mod errors;
 mod metrics;
 mod query_providers;
 mod task;
+
 use config::{load_config, Config, Website};
-use metrics::{MetricResult, WebServMessage};
-use task::select_ready;
+use dns::DnsService;
+use metrics::MetricResult;
+use task::{select_ready, select_vec};
+
+#[derive(Debug)]
+struct ServerReload;
 
 // TODO: add logging
 
@@ -99,12 +99,14 @@ pub enum WebsiteAction {
 
 pub struct QueriersServer {
     clients: Mutex<Vec<(Receiver<WebsiteAction>, Sender<String>)>>,
+    resolver: DnsService,
 }
 
 impl QueriersServer {
-    pub fn new() -> Self {
+    pub fn new(resolver: DnsService) -> Self {
         QueriersServer {
             clients: Mutex::new(Vec::new()),
+            resolver,
         }
     }
 
@@ -122,10 +124,14 @@ impl QueriersServer {
         }
     }
 
-    async fn gen_website_querier(&self, ws: Arc<Website>) -> MetricResult {
-        let delay = delay_for(Duration::new(ws.check_time_seconds, 0));
+    async fn gen_website_querier(
+        &self,
+        ws: Arc<Website>,
+        resolver: dns::DnsService,
+    ) -> MetricResult {
+        let delay = sleep(Duration::new(ws.check_time_seconds, 0));
 
-        let res = ws.url.query().await;
+        let res = ws.url.query(resolver).await;
 
         delay.await;
         res
@@ -161,7 +167,7 @@ impl QueriersServer {
                     Some((Ok(action), idx)) => {
                         match action {
                             WebsiteAction::Add(ws) => {
-                                queriers.insert(ws.clone(), Box::pin(self.gen_website_querier(ws)));
+                                queriers.insert(ws.clone(), Box::pin(self.gen_website_querier(ws, self.resolver.clone())));
                             },
                             WebsiteAction::Delete(ws) => {
                                 websites_state.remove(&ws);
@@ -188,7 +194,7 @@ impl QueriersServer {
                         websites_state.insert(ws.clone(), result);
 
                         // reinsert the website
-                        queriers.insert(ws.clone(), Box::pin(self.gen_website_querier(ws)));
+                        queriers.insert(ws.clone(), Box::pin(self.gen_website_querier(ws, self.resolver.clone())));
                     },
                     None => {}
                 }
@@ -198,246 +204,257 @@ impl QueriersServer {
 }
 
 struct WebServerState {
-    running: Mutex<bool>,
     upstream: Mutex<(Sender<WebsiteAction>, Receiver<String>)>,
-    webserver_chan: Mutex<Sender<WebServMessage>>,
+    reload_chan: Mutex<Sender<ServerReload>>,
 }
 
 impl WebServerState {
-    async fn ask_config_reloading(
-        self: Arc<Self>,
-    ) -> Result<impl warp::Reply, std::convert::Infallible> {
-        let mut tx = self.webserver_chan.lock().await.clone();
-        tx.send(WebServMessage::ReloadConfig).await.unwrap();
+    async fn ask_config_reloading(self: Arc<Self>) -> anyhow::Result<&'static str> {
+        let tx = self.reload_chan.lock().await.clone();
+        tx.send(ServerReload {}).await?;
         Ok("Server reloading requested, check the server logs")
     }
 
-    async fn get_results(self: Arc<Self>) -> Result<impl warp::Reply, std::convert::Infallible> {
+    async fn get_results(self: Arc<Self>) -> anyhow::Result<String> {
         let mut upstream = self.upstream.lock().await;
-        upstream.0.send(WebsiteAction::GetMetrics).await.unwrap();
-        Ok(upstream.1.recv().await.unwrap())
+        upstream.0.send(WebsiteAction::GetMetrics).await?;
+        upstream
+            .1
+            .recv()
+            .await
+            .ok_or(anyhow::Error::from(errors::ChannelError))
     }
 
     async fn add_website(&self, ws: Arc<Website>) {
-        let mut upstream = self.upstream.lock().await;
+        let upstream = self.upstream.lock().await;
         upstream.0.send(WebsiteAction::Add(ws)).await.unwrap();
     }
 
     async fn del_website(&self, ws: Arc<Website>) {
-        let mut upstream = self.upstream.lock().await;
+        let upstream = self.upstream.lock().await;
         upstream.0.send(WebsiteAction::Delete(ws)).await.unwrap();
     }
 }
 
-async fn web_server(listen_addr: IpAddr, listen_port: u16, state: Arc<WebServerState>) {
-    let state_clone = state.clone();
-    let get_metrics = warp::path("metrics")
-        .and(warp::path::end())
-        .map(move || state.clone())
-        .and_then(WebServerState::get_results);
+async fn web_server(
+    listen_addr: IpAddr,
+    listen_port: u16,
+    state: Arc<WebServerState>,
+) -> (Pin<Box<dyn Future<Output = ()>>>, Sender<()>) {
+    let (shutdown_tx, mut shutdown_rx) = channel(2);
 
-    // It is crucial to require the client to perform POST request to update the state
-    // to prevent caching and to respect the fact that GET requests MUST be idempotent.
-    //
-    // Important note: You MUST protect this endpoint, either by exposing the server only to
-    // local adresses, or by adding a rule to your config if you have a
-    // web server/load balancer in front on top of this server,
-    // otherwise you risk a DoS if someone call this (very) frequently !
-    let reload_server = warp::post()
-        .and(warp::path("server-reload"))
-        .and(warp::path::end())
+    let server_fut = hyper::Server::bind(&SocketAddr::from((listen_addr, listen_port)))
+        .serve(hyper::service::make_service_fn(move |_| {
+            let state = state.clone();
+            async {
+                Ok::<_, hyper::Error>(hyper::service::service_fn(move |req| {
+                    let state = state.clone();
+                    async move {
+                        let res: anyhow::Result<String> = match (req.method(), req.uri().path()) {
+                                (&http::Method::GET, "/metrics") => state
+                                    .get_results()
+                                    .await
+                                ,
+                                // It is crucial to require the client to perform POST request to update the state
+                                // to prevent caching and to respect the fact that GET requests MUST be idempotent.
+                                //
+                                // Important note: You MUST protect this endpoint, either by exposing the server only to
+                                // local adresses, or by adding a rule to your config if you have a
+                                // web server/load balancer in front on top of this server,
+                                // otherwise you risk a DoS if someone call this (very) frequently !
+                                (&http::Method::POST, "/server-reload") => {
+                                    state.ask_config_reloading().await.map(|x| x.to_string())
+                                },
+                                _ => Ok("Get metrics at /metrics".to_string()),
+                            };
+                        Ok::<_, hyper::Error>(
+                            res.map(|x| hyper::Response::new(hyper::Body::from(x)))
+                                .unwrap_or_else(|e| {
+                                    hyper::Response::builder()
+                                        .status(500)
+                                        .body(hyper::Body::from(e.to_string()))
+                                        .unwrap()
+                                }),
+                        )
+                    }
+                }))
+            }
+        }))
+        .with_graceful_shutdown(async move { shutdown_rx.recv().await.unwrap() });
+
+    (
+        Box::pin(async move { server_fut.await.unwrap() }),
+        shutdown_tx,
+    )
+    /*
         .map(move || state_clone.clone())
-        .and_then(WebServerState::ask_config_reloading);
-
-    let default_path = warp::any().map(|| "Get metrics at /metrics");
-
-    let routes = get_metrics.or(reload_server).or(default_path);
-
-    warp::serve(routes)
-        .run(SocketAddr::from((listen_addr, listen_port)))
-        .await
+        .and_then(|state: Arc<WebServerState>| async {
+            state
+                .ask_config_reloading()
+                .await
+                .map_err(|e| warp::reject::custom(WebServerError {}))
+        });
+    */
 }
 
-async fn reload_config<'a>(
-    old_config: &Config,
+struct App {
+    conf: Config,
     state: Arc<WebServerState>,
-) -> std::io::Result<Option<(Config, Option<Pin<Box<impl Future + 'a>>>)>> {
-    // Updating the list of websites to check (it should be noted that changing the
-    // http listening port or adress is not possible at runtime).
-    println!("Server reloading asked, let's see what we can do for you...");
-    // reload the config
-    let new_config: Config = match load_config().await {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!(
-                "Looks like your config file is invalid, aborting the procedure: {}",
-                e
-            );
+    tx_shutdown_webserv: Sender<()>,
+}
+
+impl App {
+    async fn new() -> anyhow::Result<(
+        App,
+        Pin<Box<dyn Future<Output = ()>>>,
+        Pin<Box<dyn Future<Output = ()>>>,
+        QueriersServer,
+        Receiver<ServerReload>,
+    )> {
+        let (tx_webserv, rx_webserv) = channel(10);
+
+        let (config, dns_resolver) = load_config().await?;
+
+        let queriers = QueriersServer::new(dns_resolver.tx);
+        let (tx, rx) = queriers.new_client().await;
+
+        let webserv_state = Arc::new(WebServerState {
+            upstream: Mutex::new((tx, rx)),
+            reload_chan: Mutex::new(tx_webserv),
+        });
+
+        let (webserv_fut, tx_shutdown_webserv) = web_server(
+            config.global.listen_addr,
+            config.global.listen_port,
+            webserv_state.clone(),
+        )
+        .await;
+
+        let app = App {
+            conf: config,
+            state: webserv_state,
+            tx_shutdown_webserv,
+        };
+
+        Ok((app, webserv_fut, dns_resolver.poller, queriers, rx_webserv))
+    }
+
+    async fn load_new_config<'a>(
+        &mut self,
+    ) -> anyhow::Result<
+        Option<(
+            Option<Pin<Box<dyn Future<Output = ()> + 'a>>>,
+            Pin<Box<dyn Future<Output = ()> + 'a>>,
+        )>,
+    > {
+        // Updating the list of websites to check (it should be noted that changing the
+        // http listening port or adress is not possible at runtime).
+        println!("Server reloading asked, let's see what we can do for you...");
+        // reload the config
+        let (new_config, new_resolver_poller) = match load_config().await {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!(
+                    "Looks like your config file is invalid, aborting the procedure: {}",
+                    e
+                );
+                return Ok(None);
+            }
+        };
+
+        if new_config == self.conf {
+            println!("No configuration changes found");
             return Ok(None);
         }
-    };
 
-    if new_config == *old_config {
-        println!("No configuration changes found");
-        return Ok(None);
-    }
-
-    if new_config.global != old_config.global {
-        // impact every watchers (in case a variable like "dns_refresh_time" changes)
-        // TODO: separate the webserver config from the one impacting the watchers to prevent too
-        // many restarts
-        for w in &new_config.websites {
-            state.add_website(w.clone()).await;
-        }
-    } else {
-        // enumerate the websites that should be added/deleted
-        let differences = new_config
-            .websites
-            .symmetric_difference(&old_config.websites);
-        // start/stop watchers accordingly
-        let mut changes = 0;
-        for x in differences {
-            changes += 1;
-            if !old_config.websites.contains(x) {
-                // website x has been added
-                state.add_website(x.clone()).await;
-            } else {
-                // website x has been deleted
-                state.del_website(x.clone()).await;
+        if new_config.global != self.conf.global {
+            // impact every watchers (in case a variable like "dns_refresh_time" changes)
+            // TODO: separate the webserver config from the one impacting the watchers to prevent too
+            // many restarts
+            for w in &new_config.websites {
+                self.state.add_website(w.clone()).await;
             }
-        }
-        println!(
-            "Server reloading finished successfully with {} website changes.",
-            changes
-        );
-    };
-
-    let mut running = state.running.lock().await;
-    let mut web_serv_fut = None;
-    if new_config.global.listen_port != old_config.global.listen_port
-        || new_config.global.listen_addr != old_config.global.listen_addr
-        || !*running
-    {
-        *running = true;
-        drop(running);
-        println!(
-            "Listening endpoint set to {}:{}",
-            new_config.global.listen_addr, new_config.global.listen_port
-        );
-        web_serv_fut = Some(Box::pin(web_server(
-            new_config.global.listen_addr,
-            new_config.global.listen_port,
-            state,
-        )));
-    }
-
-    println!("Server fully reloaded.");
-    Ok(Some((new_config, web_serv_fut)))
-}
-
-const WEB_SERV_TASK: i8 = 1;
-const QUERIERS_TASK: i8 = 2;
-const WEB_SERV_CHANNEL_TASK: i8 = 3;
-
-struct WebServerMessageReceiver {
-    rx: RefCell<Receiver<WebServMessage>>,
-}
-
-impl WebServerMessageReceiver {
-    async fn run(&self) -> Option<WebServMessage> {
-        match self.rx.borrow_mut().recv().await {
-            Some(x) => {
-                return Some(x);
+        } else {
+            // enumerate the websites that should be added/deleted
+            let differences = new_config
+                .websites
+                .symmetric_difference(&self.conf.websites);
+            // start/stop watchers accordingly
+            let mut changes: usize = 0;
+            for x in differences {
+                changes += 1;
+                if !self.conf.websites.contains(x) {
+                    // website x has been added
+                    self.state.add_website(x.clone()).await;
+                } else {
+                    // website x has been deleted
+                    self.state.del_website(x.clone()).await;
+                }
             }
-            None => {
-                eprintln!("Error encountered while reading on the web server channel, exiting...");
-                panic!();
-            }
+            println!(
+                "Server reloading finished successfully with {} website changes.",
+                changes
+            );
+        };
+
+        let mut web_serv_fut = None;
+        if new_config.global.listen_port != self.conf.global.listen_port
+            || new_config.global.listen_addr != self.conf.global.listen_addr
+        {
+            println!(
+                "Listening endpoint set to {}:{}",
+                new_config.global.listen_addr, new_config.global.listen_port
+            );
+            let (fut, sender) = web_server(
+                new_config.global.listen_addr,
+                new_config.global.listen_port,
+                self.state.clone(),
+            )
+            .await;
+            web_serv_fut = Some(fut);
+            self.tx_shutdown_webserv = sender;
         }
+
+        self.conf = new_config;
+
+        println!("Server fully reloaded.");
+        Ok(Some((web_serv_fut, new_resolver_poller.poller)))
     }
 }
 
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut config: Config = Config::default();
+async fn main() -> anyhow::Result<()> {
+    let (mut app, mut webserv_fut, mut dns_resolver_fut, queriers, mut rx_webserv) =
+        App::new().await?;
 
-    // force config reloading at startup
-    // (the main advanatge of this is that there is no substantial difference between the initial
-    // setup and subsequent refreshes)
-    let (mut tx_webserv, rx_webserv) = channel(10);
-    tx_webserv.send(WebServMessage::ReloadConfig).await.unwrap();
-
-    let queriers = QueriersServer::new();
-    let (tx, rx) = queriers.new_client().await;
-
-    let web_serv_state = Arc::new(WebServerState {
-        running: Mutex::new(false),
-        upstream: Mutex::new((tx, rx)),
-        webserver_chan: Mutex::new(tx_webserv),
-    });
-    let web_serv_fut = web_server(
-        config.global.listen_addr,
-        config.global.listen_port,
-        web_serv_state.clone(),
-    );
-
-    let web_serv_message_receiver = WebServerMessageReceiver {
-        rx: RefCell::new(rx_webserv),
-    };
-
-    let mut waiting_tasks: HashMap<i8, Pin<Box<dyn Future<Output = Option<WebServMessage>>>>> =
-        HashMap::new();
-    waiting_tasks.insert(
-        WEB_SERV_TASK,
-        Box::pin(async {
-            web_serv_fut.await;
-            None
-        }),
-    );
-    waiting_tasks.insert(
-        QUERIERS_TASK,
-        Box::pin(async {
-            queriers.run().await;
-            None
-        }),
-    );
-    waiting_tasks.insert(
-        WEB_SERV_CHANNEL_TASK,
-        Box::pin(web_serv_message_receiver.run()),
-    );
+    let mut old_tasks = Vec::new();
 
     loop {
-        match select_ready(&mut waiting_tasks).await {
-            Some((Some(WebServMessage::ReloadConfig), _)) => {
-                if let Some((new_config, web_reload_fut)) =
-                    reload_config(&config, web_serv_state.clone())
+        tokio::select! {
+            _ = &mut webserv_fut => {
+                panic!("The webserver just crashed !");
+            },
+            Some(ServerReload {}) = rx_webserv.recv() => {
+                if let Some((web_reload_fut, new_dns_resolver_fut)) =
+                    app.load_new_config()
                         .await
-                        .unwrap()
-                {
-                    // relaunch a new web server is necessary;
-                    if let Some(new_web_serv_fut) = web_reload_fut {
-                        waiting_tasks.insert(
-                            WEB_SERV_TASK,
-                            Box::pin(async {
-                                new_web_serv_fut.await;
-                                None
-                            }),
-                        );
+                        .unwrap() {
+                     // relaunch a new web server is necessary;
+                    if let Some(new_webserv_fut) = web_reload_fut {
+                        // poll the old web server to graceful completion
+                        let _ = app.tx_shutdown_webserv.send(());
+                        old_tasks.push(webserv_fut);
+                        webserv_fut = new_webserv_fut;
                     }
-                    config = new_config;
+                    old_tasks.push(dns_resolver_fut);
+                    dns_resolver_fut = new_dns_resolver_fut;
                 }
-                // reinsert itself
-                waiting_tasks.insert(
-                    WEB_SERV_CHANNEL_TASK,
-                    Box::pin(web_serv_message_receiver.run()),
-                );
-            }
-            Some((None, _)) => {
-                println!("Some service crashed !");
-            }
-            None => {
-                panic!("Should not happen !");
-            }
+            },
+            _ = select_vec(&mut old_tasks) => {},
+            _ = queriers.run() => {
+                panic!("The querier service just crashed !");
+            },
+
         }
     }
 }

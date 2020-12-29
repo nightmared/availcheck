@@ -25,8 +25,3 @@ impl MetricResult {
         self
     }
 }
-
-#[derive(Debug, PartialEq)]
-pub enum WebServMessage {
-    ReloadConfig,
-}

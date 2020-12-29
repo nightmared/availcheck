@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -10,18 +12,23 @@ use serde::de;
 use serde::{Deserialize, Deserializer};
 use tokio::fs;
 
-use crate::dns::{DnsResolverServer, DnsResolverServerState};
-use crate::query_providers::{HttpStruct, HttpWrapper, Url};
+use crate::dns::ExternalDnsResolverPoller;
+use crate::query_providers::{HttpStruct, Url};
 
 fn get_base_dir() -> PathBuf {
     let config_base_dir = env::var_os("XDG_CONFIG_HOME").unwrap_or(
-        env::var_os("HOME").unwrap_or(
-            env::current_dir()
-                .expect("Couldn't get the current directory")
-                .into_os_string(),
-        ),
+        env::var_os("HOME")
+            .map(|mut x| {
+                x.push(OsString::try_from("/.config").unwrap());
+                x
+            })
+            .unwrap_or(
+                env::current_dir()
+                    .expect("Couldn't get the current directory")
+                    .into_os_string(),
+            ),
     );
-    Path::new(&config_base_dir).join("availcheck/")
+    Path::new(&config_base_dir).join("availcheck")
 }
 
 async fn load_yaml_file<T: for<'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
@@ -52,13 +59,11 @@ fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
     duplicates
 }
 
-pub async fn load_config() -> std::io::Result<Config> {
-    let conf: SerializedConfig = load_app_data("config.yml").await?;
+pub async fn load_config() -> std::io::Result<(Config, ExternalDnsResolverPoller)> {
+    let conf: SerializedConfig = load_app_data("availcheck.yml").await?;
 
-    let mut dns_resolver = DnsResolverServer::new(DnsResolverServerState::new(Duration::new(
-        conf.global.dns_refresh_time_seconds,
-        0,
-    )));
+    let dns_resolver =
+        ExternalDnsResolverPoller::new(Duration::new(conf.global.dns_refresh_time_seconds, 0));
 
     let mut names = conf
         .websites
@@ -75,21 +80,11 @@ pub async fn load_config() -> std::io::Result<Config> {
     }
 
     let new_config = Config {
-        websites: conf
-            .websites
-            .into_iter()
-            .map(|mut x| {
-                let (tx, rx) = dns_resolver.gen_client();
-                x.url.gen_client(tx, rx);
-                Arc::new(x)
-            })
-            .collect(),
+        websites: conf.websites.into_iter().map(Arc::new).collect(),
         global: conf.global,
     };
 
-    tokio::spawn(dns_resolver.run());
-
-    Ok(new_config)
+    Ok((new_config, dns_resolver))
 }
 
 struct UrlVisitor;
@@ -114,9 +109,9 @@ impl<'de> de::Visitor<'de> for UrlVisitor {
         }
 
         match scheme_and_remainder[0] {
-            "http" | "https" => Ok(Box::new(HttpWrapper::new(HttpStruct {
+            "http" | "https" => Ok(Box::new(HttpStruct {
                 query: value.into(),
-            }))),
+            })),
             _ => Err(de::Error::invalid_value(
                 serde::de::Unexpected::Str(value),
                 &self,
@@ -188,15 +183,6 @@ struct SerializedConfig {
 pub struct Config {
     pub websites: HashSet<Arc<Website>>,
     pub global: Arc<GlobalConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            websites: HashSet::new(),
-            global: Arc::new(GlobalConfig::default()),
-        }
-    }
 }
 
 fn default_checktime() -> u64 {

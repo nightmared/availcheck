@@ -1,32 +1,26 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use c_ares_resolver::FutureResolver;
+use anyhow::Result;
 use hyper::client::connect::dns::Name;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
+use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
+use trust_dns_resolver::TokioAsyncResolver;
 
-use crate::errors::Error;
-use crate::task::{TaskClient, TaskClientService, TaskServer, TaskServerOperation};
+use crate::errors::DnsResolutionFailed;
 
-async fn resolve_host(host: &str) -> Result<IpAddr, Error> {
-    match host.parse() {
-        Ok(x) => Ok(x),
-        Err(_) =>
-        // TODO: ipv6
-        {
-            match FutureResolver::new() {
-                Ok(resolver) => {
-                    for i in &resolver.query_a(host).await? {
-                        return Ok(i.ipv4().into());
-                    }
-                    Err(Error::ResolutionFailed)
-                }
-                Err(_) => Err(Error::ResolutionFailed),
-            }
-        }
+async fn resolve_host(host: &str) -> Result<IpAddr> {
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
+    // TODO: ipv6
+    let response = resolver.ipv4_lookup(host).await?;
+    if let Some(addr) = response.into_iter().next() {
+        return Ok(IpAddr::V4(addr));
     }
+    Err(anyhow::Error::from(DnsResolutionFailed))
 }
 
 #[derive(Clone)]
@@ -38,47 +32,91 @@ pub struct DnsResolverServerInner {
 // garbage collection of hosts is ensured at reloading (reloading generates a new
 // DnsResolverServer), and restart resolving from scratch
 pub struct DnsResolverServerState {
-    hosts: Mutex<HashMap<String, DnsResolverServerInner>>,
+    hosts: HashMap<String, DnsResolverServerInner>,
     refresh_frequency: Duration,
 }
 
-impl DnsResolverServerState {
+pub type DnsQuerySender = mpsc::Sender<(Name, oneshot::Sender<Option<IpAddr>>)>;
+pub type DnsQueryReceiver = mpsc::Receiver<(Name, oneshot::Sender<Option<IpAddr>>)>;
+
+#[derive(Clone)]
+pub struct ServiceWrapper<T>(T);
+pub type DnsService = ServiceWrapper<DnsQuerySender>;
+
+pub struct ExternalDnsResolverPoller {
+    pub poller: Pin<Box<dyn Future<Output = ()>>>,
+    pub tx: DnsService,
+}
+
+impl ExternalDnsResolverPoller {
     pub fn new(refresh_frequency: Duration) -> Self {
-        DnsResolverServerState {
-            hosts: Mutex::new(HashMap::new()),
+        let state = DnsResolverServerState {
+            hosts: HashMap::new(),
             refresh_frequency,
+        };
+
+        let (tx, rx) = mpsc::channel(255);
+
+        let poller = Box::pin(perform_dns_resolution(state, rx));
+
+        ExternalDnsResolverPoller {
+            poller,
+            tx: ServiceWrapper(tx),
         }
     }
 }
 
-#[async_trait]
-impl TaskServerOperation<Name, Option<IpAddr>> for DnsResolverServerState {
-    async fn op(&self, query: Name) -> Option<Option<IpAddr>> {
+// TODO: perform graceful shutdown here too
+async fn perform_dns_resolution(mut state: DnsResolverServerState, mut rx: DnsQueryReceiver) -> () {
+    for (requested_host, response_tx) in rx.recv().await {
         // we cache the dns result so as to not spam our DNS resolver
-        let mut hosts = self.hosts.lock().await;
-        let hostname = query.as_str().to_string();
-        if let Some(inner) = hosts.get(&hostname) {
-            if inner.last_resolution_time.elapsed() < self.refresh_frequency {
-                return Some(Some(inner.last_answer));
+        let hostname = requested_host.as_str().to_string();
+        if let Some(inner) = state.hosts.get(&hostname) {
+            if inner.last_resolution_time.elapsed() < state.refresh_frequency {
+                let _ = response_tx.send(Some(inner.last_answer));
+                continue;
             }
         }
-        match resolve_host(&hostname).await {
+        let _ = response_tx.send(match resolve_host(&hostname).await {
             Ok(last_answer) => {
-                hosts.insert(
+                state.hosts.insert(
                     hostname,
                     DnsResolverServerInner {
                         last_answer,
                         last_resolution_time: Instant::now(),
                     },
                 );
-                Some(Some(last_answer))
+                Some(last_answer)
             }
             Err(_) => None,
-        }
+        });
     }
 }
 
-pub type DnsResolverServer = TaskServer<Name, Option<IpAddr>, DnsResolverServerState>;
-pub type DnsResolverClient = TaskClient<Name, Option<IpAddr>, Error>;
-pub type DnsResolverClientService =
-    TaskClientService<Name, Option<IpAddr>, std::iter::Once<IpAddr>, Error>;
+impl tower_service::Service<Name> for ServiceWrapper<DnsQuerySender> {
+    type Response = std::iter::Once<SocketAddr>;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = anyhow::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let clone = self.0.clone();
+        let (res_tx, res_rx) = oneshot::channel();
+        Box::pin(async move {
+            clone.send((name, res_tx)).await?;
+            res_rx
+                .await
+                // maybe not a good idea to loose the distinction between no record and a failing
+                // dns resolution
+                .unwrap_or(None)
+                // install a fake port (I don't think one can listen on the port 0) because hyper will overwrite it later anyway.
+                // If that behavior was to change (quite unlikely), we should realize the issue
+                // earlier too ;)
+                .map(|x| std::iter::once(SocketAddr::from((x, 0))))
+                .ok_or(anyhow::Error::from(DnsResolutionFailed))
+        })
+    }
+}
