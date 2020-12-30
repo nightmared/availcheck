@@ -66,14 +66,28 @@ impl UrlQueryMaker for HttpStruct {
     async fn _query(&self, resolver: DnsService) -> anyhow::Result<Self::R> {
         let mut http_connector = HttpConnector::new_with_resolver(resolver);
         http_connector.enforce_http(false);
-        let https_connector = HttpsConnector::from((http_connector, rustls::ClientConfig::new()));
+
+        let mut tls_config = rustls::ClientConfig::new();
+        tls_config
+            .root_store
+            .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let https_connector = HttpsConnector::from((http_connector, tls_config));
         let mut client: Client<HttpsConnector<HttpConnector<DnsService>>> =
             Client::builder().build(https_connector);
+
         let req = Request::get(&self.query.parse::<http::Uri>()?)
             .header("User-Agent", "monitoring/availcheck")
             .body(Body::empty())?;
         let timeout = tokio::time::timeout(Duration::new(7, 0), do_http_query(&mut client, req));
         let res = timeout.await;
+        if let Ok(Err(ref e)) = res {
+            println!(
+                "Error performing a query for target {:?}: {:?}",
+                self.query, e
+            );
+        }
         match res {
             Ok(Ok(x)) => Ok(x),
             Ok(Err(e)) => Err(e.into()),

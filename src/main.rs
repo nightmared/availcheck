@@ -121,6 +121,7 @@ impl QueriersServer {
 
         let gen_website_querier = |ws: Arc<Website>, resolver: DnsService| async move {
             // TODO: use a ticker instead of this drifting shitty code
+            //let interval = tokio::time::interval(Duration::new(ws.check_time_seconds, 0));
             let delay = sleep(Duration::new(ws.check_time_seconds, 0));
 
             let res = ws.url.query(resolver).await;
@@ -130,14 +131,29 @@ impl QueriersServer {
         };
 
         loop {
-            for website in self.websites_list.read().await.iter() {
+            let websites_list = self.websites_list.read().await;
+            for website in websites_list.iter() {
                 if !queriers.contains_key(website) {
+                    println!("Target '{}' added.", website.name);
                     queriers.insert(
                         website.clone(),
                         Box::pin(gen_website_querier(website.clone(), self.resolver.clone())),
                     );
                 }
             }
+            let mut deletions = Vec::new();
+            for querier in queriers.keys() {
+                // the website was deleted
+                if !websites_list.contains(querier) {
+                    println!("Target '{}' deleted.", querier.name);
+                    deletions.push(querier.clone());
+                }
+            }
+            for d in deletions {
+                queriers.remove(&d);
+            }
+            drop(websites_list);
+
             tokio::select! {
                 // poll the websites loopers
                 msg = select_ready(&mut queriers) => match msg {
@@ -336,12 +352,20 @@ async fn main() -> anyhow::Result<()> {
     let (mut app, mut webserv_fut, mut dns_resolver_fut, mut queriers, mut rx_webserv) =
         App::new().await?;
 
+    let mut querier_fut = Box::pin(queriers.run());
+
     let mut old_tasks = Vec::new();
 
     loop {
         tokio::select! {
             _ = &mut webserv_fut => {
                 panic!("The webserver just crashed !");
+            },
+            _ = &mut querier_fut => {
+                panic!("The querier service just crashed !");
+            },
+            _ = &mut dns_resolver_fut => {
+                panic!("The dns service just crashed !");
             },
             Some(ServerReload {}) = rx_webserv.recv() => {
                 if let Some((web_reload_fut, new_dns_resolver_fut)) =
@@ -360,9 +384,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             _ = select_vec(&mut old_tasks) => {},
-            _ = queriers.run() => {
-                panic!("The querier service just crashed !");
-            },
 
         }
     }
