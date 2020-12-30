@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct MetricData {
     pub status_code: Option<u16>,
     pub response_time: Option<Duration>,
     pub response_size: Option<u64>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum MetricResult {
     Success(MetricData),
     Timeout,

@@ -3,8 +3,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::future::FutureExt;
-
 pub struct SelectReady<'a, K, Fut> {
     inner: &'a mut HashMap<K, Fut>,
 }
@@ -30,7 +28,7 @@ impl<'a, K: Clone + Eq + std::hash::Hash, Fut: Future + Unpin> Future for Select
         let item = self
             .inner
             .iter_mut()
-            .find_map(|(i, f)| match (*f).poll_unpin(cx) {
+            .find_map(|(i, f)| match Pin::new(f).poll(cx) {
                 Poll::Pending => None,
                 Poll::Ready(e) => Some((i, e)),
             });
@@ -66,14 +64,14 @@ impl<'a, Fut: Future + Unpin> Future for SelectVec<'a, Fut> {
         //if self.inner.len() == 0 {
         //	return Poll::Ready(None);
         //}
-        let item = self
-            .inner
-            .iter_mut()
-            .enumerate()
-            .find_map(|(i, f)| match (*f).poll_unpin(cx) {
-                Poll::Pending => None,
-                Poll::Ready(e) => Some((i, e)),
-            });
+        let item =
+            self.inner
+                .iter_mut()
+                .enumerate()
+                .find_map(|(i, f)| match Pin::new(f).poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(e) => Some((i, e)),
+                });
         match item {
             Some((idx, res)) => {
                 self.inner.swap_remove(idx);
