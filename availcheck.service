@@ -1,15 +1,14 @@
 [Unit]
-Description=Prometheus exporter for availcheck
+Description=Prometheus exporter for HTTP monitoring
 Requires=network-online.target
 After=network-online.target
 
 [Service]
-User=nightmared
-Group=nightmared
+User=availcheck
 Restart=on-failure
-Environment="XDG_CONFIG_HOME=/home/nightmared/.config"
-ExecStart=/home/nightmared/dev/availcheck/target/release/availcheck
-ExecReload=/bin/kill -HUP $MAINPID
+WorkingDirectory=/home/availcheck/availcheck
+ExecStart=/home/availcheck/availcheck-bin
+ExecReload=/usr/bin/curl -X POST http://10.0.24.3/server-reload
 NoNewPrivileges=true
 ProtectHome=false
 ProtectSystem=strict

@@ -46,7 +46,7 @@ checksum = "cdb031dd78e28731d87d56cc8ffef4a8f36ca26c38fe2de700543e627f8a464a"
 
 [[package]]
 name = "availcheck"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1040,7 +1040,8 @@ dependencies = [
 [[package]]
 name = "trust-dns-proto"
 version = "0.20.0"
-source = "git+https://github.com/bluejekyll/trust-dns.git?rev=140881b0e685c7ae6da3ffcbea47cba9134e95bf#140881b0e685c7ae6da3ffcbea47cba9134e95bf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98a0381b2864c2978db7f8e17c7b23cca5a3a5f99241076e13002261a8ecbabd"
 dependencies = [
  "async-trait",
  "cfg-if 1.0.0",
@@ -1063,7 +1064,8 @@ dependencies = [
 [[package]]
 name = "trust-dns-resolver"
 version = "0.20.0"
-source = "git+https://github.com/bluejekyll/trust-dns.git?rev=140881b0e685c7ae6da3ffcbea47cba9134e95bf#140881b0e685c7ae6da3ffcbea47cba9134e95bf"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3072d18c10bd621cb00507d59cfab5517862285c353160366e37fbf4c74856e4"
 dependencies = [
  "cfg-if 1.0.0",
  "futures-util",

@@ -1,6 +1,6 @@
 [package]
 name = "availcheck"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Simon THOBY <git@nightmared.fr>"]
 edition = "2018"
 
@@ -8,8 +8,8 @@ edition = "2018"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_yaml = "0.8"
 tokio = { version = "1.0.1", features = ["macros", "rt-multi-thread", "sync", "time", "fs"] }
-#trust-dns-resolver = "0.20.0-alpha.3"
-trust-dns-resolver = { git = "https://github.com/bluejekyll/trust-dns.git", rev = "140881b0e685c7ae6da3ffcbea47cba9134e95bf" }
+trust-dns-resolver = "0.20.0"
+#trust-dns-resolver = { git = "https://github.com/bluejekyll/trust-dns.git", rev = "140881b0e685c7ae6da3ffcbea47cba9134e95bf" }
 tower-service = "0.3"
 hyper = { version = "0.14.2", features = [ "client", "server", "runtime", "tcp", "http1", "http2"] }
 async-trait = "0.1.24"

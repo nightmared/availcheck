@@ -1,7 +1,5 @@
 use std::collections::HashSet;
-use std::convert::TryFrom;
 use std::env;
-use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
@@ -11,41 +9,51 @@ use std::time::Duration;
 use serde::de;
 use serde::{Deserialize, Deserializer};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
 use crate::dns::ExternalDnsResolverPoller;
 use crate::query_providers::{HttpStruct, Url};
 
-fn get_base_dir() -> PathBuf {
-    let config_base_dir = env::var_os("XDG_CONFIG_HOME").unwrap_or(
-        env::var_os("HOME")
-            .map(|mut x| {
-                x.push(OsString::try_from("/.config").unwrap());
-                x
-            })
-            .unwrap_or(
-                env::current_dir()
-                    .expect("Couldn't get the current directory")
-                    .into_os_string(),
-            ),
-    );
-    Path::new(&config_base_dir).join("availcheck")
+fn get_base_dirs() -> Vec<PathBuf> {
+    let mut res = Vec::new();
+    if let Some(x) = env::var_os("XDG_CONFIG_HOME").map(|x| Path::new(&x).join("availcheck")) {
+        res.push(x);
+    }
+
+    if let Some(x) = env::var_os("HOME").map(|x| Path::new(&x).join(".config").join("availcheck")) {
+        res.push(x);
+    }
+
+    res.push(PathBuf::from(
+        env::current_dir()
+            .expect("Couldn't get the current directory")
+            .into_os_string(),
+    ));
+
+    res
 }
 
-async fn load_yaml_file<T: for<'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-    let file_content = fs::read_to_string(file_name).await?;
+async fn load_yaml_file<T: for<'a> Deserialize<'a>>(mut fd: fs::File) -> std::io::Result<T> {
+    let mut file_content = String::new();
+    fd.read_to_string(&mut file_content).await?;
     serde_yaml::from_str::<T>(&file_content).map_err(|e| {
-        eprintln!("Unable to parse the file '{}': {:?}", file_name, e);
+        eprintln!("Unable to parse the file '{:?}': {:?}", fd, e);
         io::Error::from(io::ErrorKind::InvalidData)
     })
 }
 
 async fn load_app_data<T: for<'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-    let mut config_file_path = get_base_dir();
-    config_file_path.push(file_name);
-    // if your filename is not a valid utf-8 name, it's YOUR problem (like using a weird path
-    // and/or doing weird things).
-    // TODO: look into OsStr
-    load_yaml_file(&config_file_path.to_string_lossy()).await
+    let mut config_file_paths = get_base_dirs();
+    for p in &mut config_file_paths {
+        p.push(file_name);
+        if let Ok(fd) = fs::File::open(p).await {
+            return load_yaml_file(fd).await;
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Config file not found",
+    ))
 }
 
 // This function only works if you give it a sorted list
