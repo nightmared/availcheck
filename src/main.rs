@@ -115,7 +115,7 @@ impl QueriersServer {
         )
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, mut reload_rx: Receiver<()>) {
         let mut queriers: HashMap<Arc<Website>, Pin<Box<dyn Future<Output = MetricResult>>>> =
             HashMap::new();
 
@@ -131,29 +131,6 @@ impl QueriersServer {
         };
 
         loop {
-            let websites_list = self.websites_list.read().await;
-            for website in websites_list.iter() {
-                if !queriers.contains_key(website) {
-                    println!("Target '{}' added.", website.name);
-                    queriers.insert(
-                        website.clone(),
-                        Box::pin(gen_website_querier(website.clone(), self.resolver.clone())),
-                    );
-                }
-            }
-            let mut deletions = Vec::new();
-            for querier in queriers.keys() {
-                // the website was deleted
-                if !websites_list.contains(querier) {
-                    println!("Target '{}' deleted.", querier.name);
-                    deletions.push(querier.clone());
-                }
-            }
-            for d in deletions {
-                queriers.remove(&d);
-            }
-            drop(websites_list);
-
             tokio::select! {
                 // poll the websites loopers
                 msg = select_ready(&mut queriers) => match msg {
@@ -165,7 +142,30 @@ impl QueriersServer {
                         queriers.insert(website.clone(), Box::pin(gen_website_querier(website, self.resolver.clone())));
                     },
                     None => {}
-                }
+                },
+                Some(()) = reload_rx.recv() => {
+                    let websites_list = self.websites_list.read().await;
+                    for website in websites_list.iter() {
+                        if !queriers.contains_key(website) {
+                            println!("Target '{}' added.", website.name);
+                            queriers.insert(
+                                website.clone(),
+                                Box::pin(gen_website_querier(website.clone(), self.resolver.clone())),
+                            );
+                        }
+                    }
+                    let mut deletions = Vec::new();
+                    for querier in queriers.keys() {
+                        // the website was deleted
+                        if !websites_list.contains(querier) {
+                            println!("Target '{}' deleted.", querier.name);
+                            deletions.push(querier.clone());
+                        }
+                    }
+                    for d in deletions {
+                        queriers.remove(&d);
+                    }
+                },
             }
             // TODO: improve this update to run only every min(ws.check_time_seconds | ws \in
             // websites)
@@ -352,7 +352,11 @@ async fn main() -> anyhow::Result<()> {
     let (mut app, mut webserv_fut, mut dns_resolver_fut, mut queriers, mut rx_webserv) =
         App::new().await?;
 
-    let mut querier_fut = Box::pin(queriers.run());
+    let (tx_querier_reload, rx_querier_reload) = channel(1);
+    // force loading the list of websites to monitor at startup
+    tx_querier_reload.send(()).await?;
+
+    let mut querier_fut = Box::pin(queriers.run(rx_querier_reload));
 
     let mut old_tasks = Vec::new();
 
@@ -381,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     old_tasks.push(dns_resolver_fut);
                     dns_resolver_fut = new_dns_resolver_fut;
+                    tx_querier_reload.send(()).await?;
                 }
             },
             _ = select_vec(&mut old_tasks) => {},
