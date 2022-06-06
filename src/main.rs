@@ -1,28 +1,34 @@
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::sleep;
+use clap::Parser;
+use opentelemetry::sdk::{export::trace::stdout, trace::Config};
+use tokio::sync::mpsc::channel;
+
+use tracing_subscriber::prelude::*;
 
 mod config;
 mod dns;
 mod errors;
 mod metrics;
 mod query_providers;
+mod server;
 mod task;
 
-use config::{load_config, GlobalConfig, Website};
-use dns::DnsService;
+use config::{load_config, Website};
+use errors::MainLoopError;
 use metrics::MetricResult;
-use task::{select_ready, select_vec};
+use task::select_vec;
 
-#[derive(Debug)]
-struct ServerReload;
+/// A basic prometheus exporter for probing remote endpoints
+#[derive(Parser, Debug)]
+#[clap(author, version, about)]
+struct Args {
+    /// Path to the configuration file
+    #[clap(short, long)]
+    config_file: PathBuf,
+}
 
 // TODO: add logging
 
@@ -90,267 +96,25 @@ fn gen_metrics(websites: &HashMap<Arc<Website>, MetricResult>) -> String {
     res
 }
 
-pub struct QueriersServer {
-    websites_list: Arc<RwLock<HashSet<Arc<Website>>>>,
-    values: HashMap<Arc<Website>, MetricResult>,
-    old_values: Arc<RwLock<HashMap<Arc<Website>, MetricResult>>>,
-    resolver: DnsService,
-}
-
-impl QueriersServer {
-    pub fn new(
-        resolver: DnsService,
-        websites_list: Arc<RwLock<HashSet<Arc<Website>>>>,
-    ) -> (Self, Arc<RwLock<HashMap<Arc<Website>, MetricResult>>>) {
-        let old_values = Arc::new(RwLock::new(HashMap::new()));
-
-        (
-            QueriersServer {
-                websites_list,
-                values: HashMap::new(),
-                old_values: old_values.clone(),
-                resolver,
-            },
-            old_values,
-        )
-    }
-
-    pub async fn run(&mut self, mut reload_rx: Receiver<()>) {
-        let mut queriers: HashMap<Arc<Website>, Pin<Box<dyn Future<Output = MetricResult>>>> =
-            HashMap::new();
-
-        let gen_website_querier = |ws: Arc<Website>, resolver: DnsService| async move {
-            // TODO: use a ticker instead of this drifting shitty code
-            //let interval = tokio::time::interval(Duration::new(ws.check_time_seconds, 0));
-            let delay = sleep(Duration::new(ws.check_time_seconds, 0));
-
-            let res = ws.url.query(resolver).await;
-
-            delay.await;
-            res
-        };
-
-        loop {
-            tokio::select! {
-                // poll the websites loopers
-                msg = select_ready(&mut queriers) => match msg {
-                    Some((result, website)) => {
-                        // update the state
-                        self.values.insert(website.clone(), result);
-
-                        // reinsert the website
-                        queriers.insert(website.clone(), Box::pin(gen_website_querier(website, self.resolver.clone())));
-                    },
-                    None => {}
-                },
-                Some(()) = reload_rx.recv() => {
-                    let websites_list = self.websites_list.read().await;
-                    for website in websites_list.iter() {
-                        if !queriers.contains_key(website) {
-                            println!("Target '{}' added.", website.name);
-                            queriers.insert(
-                                website.clone(),
-                                Box::pin(gen_website_querier(website.clone(), self.resolver.clone())),
-                            );
-                        }
-                    }
-                    let mut deletions = Vec::new();
-                    for querier in queriers.keys() {
-                        // the website was deleted
-                        if !websites_list.contains(querier) {
-                            println!("Target '{}' deleted.", querier.name);
-                            deletions.push(querier.clone());
-                        }
-                    }
-                    for d in deletions {
-                        queriers.remove(&d);
-                    }
-                },
-            }
-            // TODO: improve this update to run only every min(ws.check_time_seconds | ws \in
-            // websites)
-            *self.old_values.write().await = self.values.clone();
-        }
-    }
-}
-
-struct WebServerState {
-    values: Arc<RwLock<HashMap<Arc<Website>, MetricResult>>>,
-    reload_chan: Mutex<Sender<ServerReload>>,
-}
-
-impl WebServerState {
-    async fn ask_config_reloading(self: Arc<Self>) -> anyhow::Result<&'static str> {
-        let tx = self.reload_chan.lock().await.clone();
-        tx.send(ServerReload {}).await?;
-        Ok("Server reloading requested, check the server logs")
-    }
-
-    async fn get_results(self: Arc<Self>) -> anyhow::Result<String> {
-        let values = self.values.read().await;
-        Ok(gen_metrics(&values))
-    }
-}
-
-async fn web_server(
-    listen_addr: IpAddr,
-    listen_port: u16,
-    state: Arc<WebServerState>,
-) -> (Pin<Box<dyn Future<Output = ()>>>, Sender<()>) {
-    let (shutdown_tx, mut shutdown_rx) = channel(2);
-
-    let server_fut = hyper::Server::bind(&SocketAddr::from((listen_addr, listen_port)))
-        .serve(hyper::service::make_service_fn(move |_| {
-            let state = state.clone();
-            async {
-                Ok::<_, hyper::Error>(hyper::service::service_fn(move |req| {
-                    let state = state.clone();
-                    async move {
-                        let res: anyhow::Result<String> = match (req.method(), req.uri().path()) {
-                                (&http::Method::GET, "/metrics") => state
-                                    .get_results()
-                                    .await
-                                ,
-                                // It is crucial to require the client to perform POST request to update the state
-                                // to prevent caching and to respect the fact that GET requests MUST be idempotent.
-                                //
-                                // Important note: You MUST protect this endpoint, either by exposing the server only to
-                                // local adresses, or by adding a rule to your config if you have a
-                                // web server/load balancer in front on top of this server,
-                                // otherwise you risk a DoS if someone call this (very) frequently !
-                                (&http::Method::POST, "/server-reload") => {
-                                    state.ask_config_reloading().await.map(|x| x.to_string())
-                                },
-                                _ => Ok("Get metrics at /metrics".to_string()),
-                            };
-                        Ok::<_, hyper::Error>(
-                            res.map(|x| hyper::Response::new(hyper::Body::from(x)))
-                                .unwrap_or_else(|e| {
-                                    hyper::Response::builder()
-                                        .status(500)
-                                        .body(hyper::Body::from(e.to_string()))
-                                        .unwrap()
-                                }),
-                        )
-                    }
-                }))
-            }
-        }))
-        .with_graceful_shutdown(async move { shutdown_rx.recv().await.unwrap() });
-
-    (
-        Box::pin(async move { server_fut.await.unwrap() }),
-        shutdown_tx,
-    )
-}
-
-struct App {
-    conf: Arc<GlobalConfig>,
-    websites_list: Arc<RwLock<HashSet<Arc<Website>>>>,
-    state: Arc<WebServerState>,
-    tx_shutdown_webserv: Sender<()>,
-}
-
-impl App {
-    async fn new() -> anyhow::Result<(
-        App,
-        Pin<Box<dyn Future<Output = ()>>>,
-        Pin<Box<dyn Future<Output = ()>>>,
-        QueriersServer,
-        Receiver<ServerReload>,
-    )> {
-        let (tx_webserv, rx_webserv) = channel(10);
-
-        let (config, dns_resolver) = load_config().await?;
-
-        let websites_list = Arc::new(RwLock::new(config.websites));
-
-        let (queriers, values) = QueriersServer::new(dns_resolver.tx, websites_list.clone());
-
-        let webserv_state = Arc::new(WebServerState {
-            values,
-            reload_chan: Mutex::new(tx_webserv),
-        });
-
-        let (webserv_fut, tx_shutdown_webserv) = web_server(
-            config.global.listen_addr,
-            config.global.listen_port,
-            webserv_state.clone(),
-        )
-        .await;
-
-        let app = App {
-            conf: config.global,
-            websites_list,
-            state: webserv_state,
-            tx_shutdown_webserv,
-        };
-
-        Ok((app, webserv_fut, dns_resolver.poller, queriers, rx_webserv))
-    }
-
-    async fn load_new_config<'a>(
-        &mut self,
-    ) -> anyhow::Result<
-        Option<(
-            Option<Pin<Box<dyn Future<Output = ()> + 'a>>>,
-            Pin<Box<dyn Future<Output = ()> + 'a>>,
-        )>,
-    > {
-        // Updating the list of websites to check (it should be noted that changing the
-        // http listening port or adress is not possible at runtime).
-        println!("Server reloading asked, let's see what we can do for you...");
-        // reload the config
-        let (new_config, new_resolver_poller) = match load_config().await {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!(
-                    "Looks like your config file is invalid, aborting the procedure: {}",
-                    e
-                );
-                return Ok(None);
-            }
-        };
-
-        if *new_config.global == *self.conf
-            && new_config.websites == *self.websites_list.read().await
-        {
-            println!("No configuration changes found");
-            return Ok(None);
-        }
-
-        *self.websites_list.write().await = new_config.websites;
-        println!("Server reloading finished successfully.",);
-
-        let mut web_serv_fut = None;
-        if new_config.global.listen_port != self.conf.listen_port
-            || new_config.global.listen_addr != self.conf.listen_addr
-        {
-            println!(
-                "Listening endpoint set to {}:{}",
-                new_config.global.listen_addr, new_config.global.listen_port
-            );
-            let (fut, sender) = web_server(
-                new_config.global.listen_addr,
-                new_config.global.listen_port,
-                self.state.clone(),
-            )
-            .await;
-            web_serv_fut = Some(fut);
-            self.tx_shutdown_webserv = sender;
-        }
-
-        println!("Server fully reloaded.");
-
-        self.conf = new_config.global;
-        Ok(Some((web_serv_fut, new_resolver_poller.poller)))
-    }
-}
-
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), MainLoopError> {
+    let args = Args::parse();
+
+    let config = load_config(args.config_file.as_path()).await?;
+
+    if config.global.enable_tracing {
+        let tracer = opentelemetry_jaeger::new_pipeline()
+            .with_service_name("availcheck")
+            .install_simple()?;
+        let opentelemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+        tracing_subscriber::registry()
+            .with(opentelemetry)
+            .try_init()?;
+    };
+
     let (mut app, mut webserv_fut, mut dns_resolver_fut, mut queriers, mut rx_webserv) =
-        App::new().await?;
+        server::App::new(config).await?;
 
     let (tx_querier_reload, rx_querier_reload) = channel(1);
     // force loading the list of websites to monitor at startup
@@ -371,9 +135,9 @@ async fn main() -> anyhow::Result<()> {
             _ = &mut dns_resolver_fut => {
                 panic!("The dns service just crashed !");
             },
-            Some(ServerReload {}) = rx_webserv.recv() => {
+            Some(server::ServerReload {}) = rx_webserv.recv() => {
                 if let Some((web_reload_fut, new_dns_resolver_fut)) =
-                    app.load_new_config()
+                    app.load_new_config(args.config_file.as_path())
                         .await
                         .unwrap() {
                      // relaunch a new web server is necessary;
@@ -388,7 +152,9 @@ async fn main() -> anyhow::Result<()> {
                     tx_querier_reload.send(()).await?;
                 }
             },
-            _ = select_vec(&mut old_tasks) => {},
+            Some(Err(e)) = select_vec(&mut old_tasks) => {
+                println!("{:?}", e);
+            },
 
         }
     }
