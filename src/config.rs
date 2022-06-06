@@ -1,37 +1,16 @@
 use std::collections::HashSet;
-use std::env;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::de;
 use serde::{Deserialize, Deserializer};
 use tokio::fs;
+use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
-use crate::dns::ExternalDnsResolverPoller;
 use crate::query_providers::{HttpStruct, Url};
-
-fn get_base_dirs() -> Vec<PathBuf> {
-    let mut res = Vec::new();
-    if let Some(x) = env::var_os("XDG_CONFIG_HOME").map(|x| Path::new(&x).join("availcheck")) {
-        res.push(x);
-    }
-
-    if let Some(x) = env::var_os("HOME").map(|x| Path::new(&x).join(".config").join("availcheck")) {
-        res.push(x);
-    }
-
-    res.push(PathBuf::from(
-        env::current_dir()
-            .expect("Couldn't get the current directory")
-            .into_os_string(),
-    ));
-
-    res
-}
 
 async fn load_yaml_file<T: for<'a> Deserialize<'a>>(mut fd: fs::File) -> std::io::Result<T> {
     let mut file_content = String::new();
@@ -40,20 +19,6 @@ async fn load_yaml_file<T: for<'a> Deserialize<'a>>(mut fd: fs::File) -> std::io
         eprintln!("Unable to parse the file '{:?}': {:?}", fd, e);
         io::Error::from(io::ErrorKind::InvalidData)
     })
-}
-
-async fn load_app_data<T: for<'a> Deserialize<'a>>(file_name: &str) -> std::io::Result<T> {
-    let mut config_file_paths = get_base_dirs();
-    for p in &mut config_file_paths {
-        p.push(file_name);
-        if let Ok(fd) = fs::File::open(p).await {
-            return load_yaml_file(fd).await;
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "Config file not found",
-    ))
 }
 
 // This function only works if you give it a sorted list
@@ -67,11 +32,8 @@ fn get_duplicates<'a>(sorted_vec: &'a Vec<&String>) -> HashSet<&'a str> {
     duplicates
 }
 
-pub async fn load_config() -> std::io::Result<(Config, ExternalDnsResolverPoller)> {
-    let conf: SerializedConfig = load_app_data("availcheck.yml").await?;
-
-    let dns_resolver =
-        ExternalDnsResolverPoller::new(Duration::new(conf.global.dns_refresh_time_seconds, 0));
+pub async fn load_config(config_path: &Path) -> std::io::Result<Config> {
+    let conf: SerializedConfig = load_yaml_file(File::open(config_path).await?).await?;
 
     let mut names = conf
         .websites
@@ -92,40 +54,7 @@ pub async fn load_config() -> std::io::Result<(Config, ExternalDnsResolverPoller
         global: conf.global,
     };
 
-    Ok((new_config, dns_resolver))
-}
-
-struct UrlVisitor;
-
-impl<'de> de::Visitor<'de> for UrlVisitor {
-    type Value = Box<dyn Url + Send + Sync>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("an url matching scheme://host:port/path")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        let scheme_and_remainder: Vec<&str> = value.splitn(2, "://").collect();
-        if scheme_and_remainder.len() != 2 {
-            return Err(de::Error::invalid_value(
-                serde::de::Unexpected::Str(value),
-                &self,
-            ));
-        }
-
-        match scheme_and_remainder[0] {
-            "http" | "https" => Ok(Box::new(HttpStruct {
-                query: value.into(),
-            })),
-            _ => Err(de::Error::invalid_value(
-                serde::de::Unexpected::Str(value),
-                &self,
-            )),
-        }
-    }
+    Ok(new_config)
 }
 
 impl<'de> Deserialize<'de> for Box<dyn Url + Send + Sync> {
@@ -133,11 +62,15 @@ impl<'de> Deserialize<'de> for Box<dyn Url + Send + Sync> {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_str(UrlVisitor)
+        let url = url::Url::deserialize(deserializer)?;
+        match url.scheme() {
+            "http" | "https" => Ok(Box::new(HttpStruct { query_url: url })),
+            _ => Err(de::Error::custom("Unsupported URL scheme")),
+        }
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct Website {
     // TODO: sanitize this field
     pub name: String,
@@ -166,6 +99,8 @@ pub struct GlobalConfig {
     pub listen_port: u16,
     #[serde(default = "default_addr")]
     pub listen_addr: IpAddr,
+    #[serde(default = "default_tracing_enabled")]
+    pub enable_tracing: bool,
     #[serde(default = "default_dns_refresh_time")]
     pub dns_refresh_time_seconds: u64,
 }
@@ -175,6 +110,7 @@ impl Default for GlobalConfig {
         GlobalConfig {
             listen_port: default_port(),
             listen_addr: default_addr(),
+            enable_tracing: default_tracing_enabled(),
             dns_refresh_time_seconds: default_dns_refresh_time(),
         }
     }
@@ -199,6 +135,10 @@ fn default_checktime() -> u64 {
 
 fn default_port() -> u16 {
     9666
+}
+
+fn default_tracing_enabled() -> bool {
+    false
 }
 
 fn default_dns_refresh_time() -> u64 {
